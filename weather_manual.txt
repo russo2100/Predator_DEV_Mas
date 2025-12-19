@@ -1,0 +1,1 @@
+ArcticBlastScore=0.8; Alerts=['Strong Arctic Blast across US']; Season=WINTER
