@@ -23,27 +23,31 @@ import datetime as dt
 import pytz
 
 
+
 def get_market_status():
-    moscow_tz = pytz.timezone("Europe/Moscow")
+    moscow_tz = pytz.timezone('Europe/Moscow')
     now = dt.datetime.now(moscow_tz)
-    weekday = now.weekday()  # 0=Пн ... 5=Сб ... 6=Вс
     current_time = now.time()
+    weekday = now.weekday() # 0=Mon, 6=Sun
 
-    # Торгуем по субботам, НЕ торгуем по воскресеньям
+    # 1. Воскресенье - выходной
     if weekday == 6:
-        return False, "🌙 Воскресенье (выходной)"
+        return False, "ВОСКРЕСЕНЬЕ: ВЫХОДНОЙ"
 
-    # Клиринг (как вы задали сегодня)
-    if dt.time(14, 0) <= current_time <= dt.time(14, 5):
-        return False, "⏳ Дневной клиринг (14:00-14:05 МСК)"
-    if dt.time(18, 45) <= current_time <= dt.time(19, 0):
-        return False, "⏳ Вечерний клиринг (18:45-19:00 МСК)"
+    # 2. Рабочее окно Пн-Сб: 08:50 - 23:50
+    start_trade = dt.time(8, 50)
+    end_trade = dt.time(23, 50)
+    if not (start_trade <= current_time <= end_trade):
+        return False, f"ВНЕ РАБОЧЕГО ВРЕМЕНИ (Рынок откроется в 08:50)"
 
-    # Торговые часы
-    if dt.time(8, 50) <= current_time <= dt.time(23, 50):
-        return True, "🚀 Торги активны"
+    # 3. Клиринги (МСК)
+    # Дневной: 14:00-14:05 | Вечерний: 18:50-19:05
+    if (dt.time(14, 0) <= current_time <= dt.time(14, 5)) or \
+       (dt.time(18, 50) <= current_time <= dt.time(19, 5)):
+        return False, "ПАУЗА: КЛИРИНГ"
 
-    return False, f"🌙 Рынок закрыт ({current_time.strftime('%H:%M')} МСК)"
+    return True, "РЫНОК ОТКРЫТ"
+
 
 
 
@@ -1183,18 +1187,21 @@ async def main_loop():
     # --- ИНИЦИАЛИЗАЦИЯ ТЕНЕВОГО АДАПТЕРА ---
     shadow_adapter = MultiAgentShadowAdapter()  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
     print("👻 Shadow Mode активирован: агенты пишут логи в shadow_agents_log.jsonl")
-    await telegram_smoke_test()
     await send_telegram("✅ Predator стартовал. Telegram OK.")
 
     # ---------------------------------------
     cycle = 0
     trailing_manager: Optional[TrailingStopManager] = None
     position_timer = PositionTimer()
+    
+    last_api_news_time = None
+    cached_api_news = ""
 
     # Дефолтный контекст новостей и bias
     news_context: Dict[str, Any] = {"bias": None, "summary": ""}
     current_bias: str = "neutral"
     
+
     # --- Восстановление времени входа позиции при старте бота ---
     try:
         pos_start = await executor.get_position_data(FIGI_NRZ5)
@@ -1467,7 +1474,9 @@ async def main_loop():
                     
             print(f"DEBUG TRAILING: lots={lots}, tm={'EXISTS' if trailing_manager else 'NONE'}, avgprice={avg_price:.4f}, atr={atr:.4f}")
 
-
+                        # === ВОТ ЭТИ 3 СТРОКИ ВСТАВЛЯЕШЬ СЮДА ===
+            print(f"⏳ Итерация {cycle} завершена. Спим 60 секунд...")
+            await asyncio.sleep(60)
 
             if early_exit_action:
                 pass
@@ -1520,6 +1529,11 @@ async def main_loop():
                         position_timer.reset()
                         lots = 0
                         print(f"⏳ Цикл {cycle} завершён по trailing-stop | price={price:.3f}")
+                
+                        # === Пауза после ИТЕРАЦИИ, если был ранний выход ===
+                        print(f"⏳ Цикл {cycle} завершён, спим 60 секунд...")
+                        await asyncio.sleep(60)
+                        continue        
 
 
 
@@ -1534,7 +1548,11 @@ async def main_loop():
                     manual_news = get_fundamental_news()
                     
                     # 2. Тянем свежие новости из API (Finnhub + NewsAPI)
-                    api_news = await news_agent.get_aggregated_sentiment_context()
+                    now_utc = dt.datetime.now(dt.timezone.utc)
+                    if last_api_news_time is None or (now_utc - last_api_news_time).total_seconds() > 1200:
+                        cached_api_news = await news_agent.get_aggregated_sentiment_context()
+                        last_api_news_time = now_utc
+                    api_news = cached_api_news
                     
                     # 3. Формируем финальный контекст для Planner/Analyst
                     # Если в файле пусто, используем данные из API
@@ -1857,45 +1875,34 @@ async def main_loop():
             await send_telegram(error_msg) # Обязательно шлем алерт о падении цикла
             await asyncio.sleep(CHECK_INTERVAL_SEC)
 
-            # Умный режим сна
-            msk_now = dt.datetime.now(dt.timezone.utc) + timedelta(hours=3)
-            current_weekday = msk_now.weekday()
-            current_hour = msk_now.hour
-            current_minute = msk_now.minute
+        # ВСТАВЛЯТЬ ТУТ (ВНЕ EXCEPT, НО ВНУТРИ WHILE TRUE)
+        # === СИСТЕМА УПРАВЛЕНИЯ ПАУЗАМИ (СТРОГО МСК ПО ТЗ) ===
+        is_open_final, status_msg_final = get_market_status()
+        moscow_tz = pytz.timezone('Europe/Moscow')
+        now_msk = dt.datetime.now(moscow_tz)
 
-            sleep_time = 60
-            mode_name = "🔥 Активная сессия"
-
-            minutes_now = current_hour * 60 + current_minute
-
-            if current_weekday == 6:
-                sleep_time = 300
-                mode_name = "🌙 Выходные"
-            elif minutes_now < (8 * 60 + 45):
-                sleep_time = 180
-                mode_name = "🌅 Перед открытием (Ждём 08:45 МСК)"
-            elif 8 * 60 + 45 <= minutes_now < 10 * 60:
-                sleep_time = 60
-                mode_name = "🌅 Предоткрытие"
-            elif 10 * 60 <= minutes_now < 14 * 60:
-                sleep_time = 120
-                mode_name = "☕ День (Ждём Америку)"
-            elif 14 * 60 <= minutes_now < 19 * 60:
-                sleep_time = 90
-                mode_name = "🇺🇸 Америка просыпается"
-            elif 19 * 60 <= minutes_now < 24 * 60:
-                sleep_time = 60
-                mode_name = "🔥 Активная сессия (США)"
+        if is_open_final:
+            # ПУНКТ 1: Рынок открыт (Пн-Сб, 08:50-23:50) -> Пауза 60 секунд
+            await asyncio.sleep(60)
+        
+        elif now_msk.weekday() == 6:
+            # ПУНКТ 3: Воскресенье. Спим 5 минут, пишем в лог раз в 3 часа
+            if now_msk.hour % 3 == 0 and now_msk.minute < 5:
+                print(f"💤 [{now_msk.strftime('%H:%M')}] Воскресенье: режим ожидания (лог раз в 3ч)")
+            await asyncio.sleep(300)
+            
+        else:
+            # ПУНКТ 2: Клиринг или Ночь (Пн-Сб)
+            if "КЛИРИНГ" in status_msg_final:
+                print(f"☕ [{now_msk.strftime('%H:%M')}] Пауза: КЛИРИНГ. Ждем...")
+                await asyncio.sleep(30)
             else:
-                sleep_time = 180
-                mode_name = "😴 Ночь"
+                # Обычная ночь Пн-Сб
+                if now_msk.minute == 0:
+                    print(f"🌙 [{now_msk.strftime('%H:%M')}] Рынок закрыт. Ждем открытия в 08:50.")
+                await asyncio.sleep(60)
 
-            print(f"{mode_name}. Пауза {sleep_time} сек.\n")
-            await asyncio.sleep(sleep_time)
 
-        except Exception as e:
-            print(f"💥 Глобальная ошибка цикла: {e}")
-            await asyncio.sleep(10)
 
 
 if __name__ == "__main__":

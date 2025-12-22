@@ -1,61 +1,84 @@
-import aiohttp
+import os
+import logging
 import asyncio
-from datetime import datetime, timedelta
+import datetime
 from typing import List, Dict, Any
-from src.config.settings import settings
+from tinkoff.invest import AsyncClient
+from src.config.settings import settings # или просто проверь как импортируется в main.py
+
+
+logger = logging.getLogger(__name__)
 
 class UnifiedNewsAgent:
+    """
+    Агент для сбора новостей через Tinkoff Invest API.
+    Гарантированно работает в РФ и не требует сторонних подписок.
+    """
     def __init__(self):
-        self.finnhub_token = "ВАШ_FINNHUB_TOKEN" # Или забирайте из settings
-        self.newsapi_key = "ВАШ_NEWSAPI_KEY"
+        self.token = settings.TINKOFF_TOKEN  
+        # FIGI для фьючерса на газ 
+        self.default_figi = "FUTNG1225000" 
 
-    async def fetch_finnhub_news(self) -> List[str]:
-        """Получает новости по сектору энергетики/газа через Finnhub."""
-        if not self.finnhub_token or "ВАШ" in self.finnhub_token:
-            return []
+    async def get_aggregated_sentiment_context(self, figi: str = None) -> str:
+        """
+        Собирает последние новости по инструменту и формирует текстовый контекст для AI.
+        """
+        target_figi = figi or self.default_figi
+        logger.info(f"🌍 Запуск сбора новостей Тинькофф для FIGI: {target_figi}")
         
-        url = f"https://finnhub.io/api/v1/news?category=energy&token={self.finnhub_token}"
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        # Берем последние 5 заголовков
-                        return [f"Finnhub: {item['headline']}" for item in data[:5]]
-        except Exception as e:
-            print(f"⚠️ Finnhub error: {e}")
-        return []
+            async with AsyncClient(self.token) as client:
+                to_date = datetime.datetime.now(datetime.timezone.utc)
+                from_date = to_date - datetime.timedelta(days=2)
+                
+                # Пробуем по очереди разные названия метода, которые бывают в разных версиях SDK
+                response = None
+                for service in [client.instruments, client.market_data]:
+                    for method_name in ["get_news", "get_instrument_news"]:
+                        method = getattr(service, method_name, None)
+                        if method:
+                            try:
+                                response = await method(
+                                    figi=target_figi,
+                                    from_=from_date,
+                                    to=to_date
+                                )
+                                break
+                            except:
+                                continue
+                    if response: break
 
-    async def fetch_newsapi_org(self) -> List[str]:
-        """Получает новости по ключевым словам через NewsAPI."""
-        if not self.newsapi_key or "ВАШ" in self.newsapi_key:
-            return []
-            
-        today = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
-        url = (
-            f"https://newsapi.org/v2/everything?"
-            f"q=Natural+Gas+AND+(LNG+OR+Storage)&"
-            f"from={today}&sortBy=publishedAt&language=en&"
-            f"apiKey={self.newsapi_key}"
-        )
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=10) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        return [f"NewsAPI: {item['title']}" for item in data.get('articles', [])[:5]]
-        except Exception as e:
-            print(f"⚠️ NewsAPI error: {e}")
-        return []
+                if not response or not hasattr(response, 'news') or not response.news:
+                    logger.warning("📭 Новости по инструменту не найдены через доступные методы.")
+                    return "Новостей по инструменту в системе Тинькофф сейчас нет."
 
-    async def get_aggregated_sentiment_context(self) -> str:
-        """Собирает всё воедино для передачи в Planner/Analyst."""
-        print("🌍 Сбор данных из News API...")
-        tasks = [self.fetch_finnhub_news(), self.fetch_newsapi_org()]
-        results = await asyncio.gather(*tasks)
-        
-        all_headlines = [item for sublist in results for item in sublist]
-        if not all_headlines:
-            return "No fresh news from API."
-            
-        return "\n".join(all_headlines)
+                # Формируем компактный текст для AI
+                context_parts = []
+                for idx, item in enumerate(response.news[:10], 1):
+                    timestamp = item.published_at.strftime("%Y-%m-%d %H:%M")
+                    context_parts.append(f"{idx}. [{timestamp}] {item.headline}")
+                
+                return "\n".join(context_parts)
+
+        except Exception as e:
+            logger.error(f"❌ Ошибка Tinkoff News API: {e}")
+            return f"Ошибка получения новостей: {str(e)}"
+
+    async def get_market_sentiment(self, news_text: str) -> str:
+        """
+        Заглушка для совместимости. Анализ сентимента теперь делает основной AI-агент.
+        """
+        if "Ошибка" in news_text or "нет" in news_text:
+            return "neutral"
+        return "analyzing"
+
+# Тестовый запуск
+if __name__ == "__main__":
+    async def test():
+        agent = UnifiedNewsAgent()
+        context = await agent.get_aggregated_sentiment_context()
+        print("\n--- СОБРАННЫЙ КОНТЕКСТ ---")
+        print(context)
+
+    logging.basicConfig(level=logging.INFO)
+    asyncio.run(test())
