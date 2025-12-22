@@ -1025,49 +1025,67 @@ async def log_trade(
         print(f"⚠️ Ошибка логирования сделки: {e}")
 
 
-def log_decision_block(
-    cycle: int,
-    price: float,
-    rsi: float,
-    trend: str,
-    lots: int,
-    pnl_pct: float,
-    holding_hours: float,
-    ai_signal: str,
-    ai_confidence: float,
-    bias: str,
-    minutes_to_clearing: int,
-    rules: dict,
-    action: str,
-    reason: str = ""
-):
-    """Детальное логирование перед принятием решения."""
+def log_decision_block(cycle: int, price: float, rsi: float, trend: str, lots: int, pnl_pct: float, 
+                       holding_hours: float, ai_signal: str, ai_confidence: float, bias: str, 
+                       minutes_to_clearing: int, rules: dict, action: str, reason: str):
+    """
+    Выводит блок принятия решения в консоль и записывает его в shadow_agents_log.jsonl.
+    """
+    import json
+    import os
+    from datetime import datetime
+    import pytz
+
+    # 1. Визуальный вывод в консоль
     print("\n" + "="*70)
-    print(f"🔍 DECISION BLOCK | Цикл {cycle}")
-    print(f"   📊 Цена: {price:.3f} | RSI: {rsi:.1f} | Тренд: {trend}")
-    print(
-        f"   💼 Позиция: {lots} лот | PnL: {pnl_pct:+.2f}% | Holding: {holding_hours:.1f}ч")
-    print(
-        f"   🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
-    print(f"   ⏰ До клиринга: {minutes_to_clearing} мин")
+    print(f"📊 DECISION BLOCK | Cycle: {cycle} | {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%H:%M:%S')}")
+    print("-" * 70)
+    print(f"💰 Price: {price:.3f} | RSI: {rsi:.1f} | Trend: {trend}")
+    print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
+    print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
+    
+    if rules.get('max_buy_price'):
+        print(f"🟢 MAX_BUY: {rules['max_buy_price']:.3f}")
+    if rules.get('min_sell_price'):
+        print(f"🔴 MIN_SELL: {rules['min_sell_price']:.3f}")
 
-    if rules.get("max_buy_price"):
-        print(f"   📋 MAX_BUY: {rules['max_buy_price']:.3f}")
-    if rules.get("min_sell_price"):
-        print(f"   📋 MIN_SELL: {rules['min_sell_price']:.3f}")
-
-    emoji_map = {
-        "BUY_1": "🟢",
-        "SELL_ALL": "🔴",
-        "SELL_HALF": "🟠",
-        "NOOP": "⚪"
-    }
-    emoji = emoji_map.get(action, "❓")
-
-    print(f"   {emoji} РЕШЕНИЕ: {action}")
+    emoji_map = {"BUY": "🚀", "SELL_ALL": "💥", "SELL_HALF": "⚖️", "NOOP": "😴"}
+    emoji = emoji_map.get(action, "🔍")
+    print(f"➡️ ACTION: {emoji} {action}")
     if reason:
-        print(f"   💬 Причина: {reason}")
+        print(f"📝 Reason: {reason}")
     print("="*70 + "\n")
+
+    # 2. Формируем расширенный лог (похожий на ваш старый формат)
+    log_entry = {
+        "timestamp": datetime.now(pytz.timezone("Europe/Moscow")).isoformat(),
+        "cycle": cycle,
+        "input_state": {
+            "price": price,
+            "rsi": rsi,
+            "trend": trend,
+            "lots": lots,
+            "pnl_pct": pnl_pct,
+            "holding_hours": holding_hours,
+            "bias": bias
+        },
+        "decision": {
+            "ai_signal": ai_signal,
+            "ai_confidence": ai_confidence,
+            "action": action,
+            "reason": reason,
+            "rules": rules
+        }
+    }
+
+    # 3. Запись в файл shadow_agents_log.jsonl
+    try:
+        log_file = "shadow_agents_log.jsonl"
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"❌ Ошибка записи в shadow_agents_log.jsonl: {e}")
+
 
 
 def decide_action(
@@ -1080,47 +1098,74 @@ def decide_action(
     bias: str,
     rules: dict = None
 ) -> Action:
-    # 1. Сначала парсим базовые сигналы
+    # 1. Нормализация входа
     sig = (ai_signal or "HOLD").upper().strip()
     b = (bias or "neutral").lower().strip()
+    rules = rules or {}
 
-    # 2. ПРИНУДИТЕЛЬНЫЙ ВХОД (FORCE BUY) - ПЕРЕХВАТЫВАЕМ ТУТ
-    if rules and rules.get("force_buy") is True:
+    # 2. FORCE BUY (как у тебя было)
+    if rules.get("force_buy") is True:
         if lots == 0:
             print("🚨 FORCE_BUY ОБНАРУЖЕН! Игнорируем AI и входим.")
             return "OPEN_LONG"
         elif 0 < lots < max_lots_allowed:
             return "ADD_LONG"
 
-    # 3. Если принудительного входа нет, работаем по обычной логике
+    # 3. AI слишком неуверен — ничего не делаем
+    if ai_confidence < 60:
+        return "NOOP"
+
+    # 4. HOLD как явный сигнал
     if sig == "HOLD":
         return "NOOP"
 
-    # 3.1) Вход в LONG
-    if lots >= 0 and sig == "BUY":
-        # --- НОВАЯ ЛОГИКА RSI + TREND ---
-        if rsi > 70:
-            if trend_5m != "UPTREND":
-                print(f"⚠️ RSI {rsi:.1f} перекупленность в боковике/падающем, вход LONG заблокирован")
-                return "NOOP"
-            else:
-                print(f"🔥 RSI {rsi:.1f} высокий, но UPTREND активен. РАЗРЕШАЕМ импульсный вход.")
-        
-        # Фильтрация для медвежьего рынка
-        if trend_5m == "DOWNTREND" and rsi > 45:
-            return "NOOP"
-        if b == "bearish" and rsi > 55:
+    # 5. LONG‑логика (покупка)
+    if sig == "BUY" and lots >= 0:
+        # жесткий фильтр по BIAS: при явном bearish не лезем, если рынок не дикого перепродана
+        if b == "bearish" and rsi > 25:
             return "NOOP"
 
+        # перекупленность без ап‑тренда не берем
+        if rsi > 70 and trend_5m != "UPTREND":
+            print(f"⚠️ RSI {rsi:.1f} перекупленность без ап‑тренда, вход LONG заблокирован")
+            return "NOOP"
 
-    # 3.2) Вход в SHORT
-    if lots <= 0 and sig == "SELL":
-        if rsi < 30:
-            if trend_5m != "DOWNTREND":
-                print(f"⚠️ RSI {rsi:.1f} перепроданность, вход SHORT заблокирован")
-                return "NOOP"
-            else:
-                print(f"🔥 RSI {rsi:.1f} низкий, но DOWNTREND активен. РАЗРЕШАЕМ вход в шорт.")
+        # медвежий тренд + высокий RSI — не усредняемся против движения
+        if trend_5m == "DOWNTREND" and rsi > 50:
+            return "NOOP"
+
+        # ВХОД: если позы нет — открываем 1 лот
+        if lots == 0:
+            if max_lots_allowed > 0:
+                return "BUY_1"
+            return "NOOP"
+
+        # ДОБОР: есть позиция, но не превышаем лимит
+        if 0 < lots < max_lots_allowed and rsi < 60 and trend_5m in ("UPTREND", "FLAT"):
+            return "BUY_1"
+
+        return "NOOP"
+
+    # 6. SHORT/выход (SELL‑логика)
+    if sig == "SELL" and lots > 0:
+        # при явном bullish не закрываем всё сразу, если нет перекупленности
+        if b == "bullish" and rsi < 75:
+            return "NOOP"
+
+        # перепроданность без даун‑тренда — не рубим всё
+        if rsi < 30 and trend_5m != "DOWNTREND":
+            print(f"⚠️ RSI {rsi:.1f} перепроданность без даун‑тренда, полный выход заблокирован")
+            return "NOOP"
+
+        # сильный SELL — полный выход
+        if ai_confidence >= 70 or trend_5m == "DOWNTREND":
+            return "SELL_ALL"
+
+        # если уверенность поменьше — можно оставить как NOOP или SELL_HALF (если поддерживаешь)
+        return "NOOP"
+
+    # 7. Если сигналы не BUY/SELL — ничего не делаем
+    return "NOOP"
 
 
 
@@ -1180,16 +1225,13 @@ async def main_loop():
     analyst = AgentsMarketAnalyst()
     planner = PlannerAgent()
     executor = OrderExecutor(token)
-    # --- [ИЗМЕНЕНИЕ: Инициализация нового агрегатора новостей] ---
     news_agent = UnifiedNewsAgent() 
     shadowadapter = MultiAgentShadowAdapter()
       
-    # --- ИНИЦИАЛИЗАЦИЯ ТЕНЕВОГО АДАПТЕРА ---
-    shadow_adapter = MultiAgentShadowAdapter()  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
+    shadow_adapter = MultiAgentShadowAdapter()
     print("👻 Shadow Mode активирован: агенты пишут логи в shadow_agents_log.jsonl")
     await send_telegram("✅ Predator стартовал. Telegram OK.")
 
-    # ---------------------------------------
     cycle = 0
     trailing_manager: Optional[TrailingStopManager] = None
     position_timer = PositionTimer()
@@ -1197,17 +1239,14 @@ async def main_loop():
     last_api_news_time = None
     cached_api_news = ""
 
-    # Дефолтный контекст новостей и bias
     news_context: Dict[str, Any] = {"bias": None, "summary": ""}
     current_bias: str = "neutral"
-    
 
-    # --- Восстановление времени входа позиции при старте бота ---
+    # Восстановление позиции при старте
     try:
         pos_start = await executor.get_position_data(FIGI_NRZ5)
         if pos_start is None:
-            print(
-                "⏱️ PositionTimer: не удалось получить позицию при старте (сеть), таймер не восстановлен")
+            print("⏱️ PositionTimer: не удалось получить позицию при старте (сеть)")
         else:
             lots_start = pos_start["lots"]
             avg_price_start = pos_start["average_price"]
@@ -1215,59 +1254,44 @@ async def main_loop():
                 entry_time = load_last_entry_time_from_history(FIGI_NRZ5)
                 if entry_time is not None:
                     position_timer.set_entry_time(entry_time)
-                    print(f"⏱️ PositionTimer восстановлен из истории: {entry_time.isoformat()}")
+                    print(f"⏱️ PositionTimer восстановлен: {entry_time.isoformat()}")
                 else:
-                    # Если истории нет, стартуем таймер СЕЙЧАС (консервативно)
                     position_timer.start()
-                    print(f"⏱️ PositionTimer запущен (позиция восстановлена из портфеля)")
-                if position_timer.entry_time:
-                    print(f"⏱️ Вход в позицию: {position_timer.entry_time.strftime('%H:%M:%S')} UTC")
-            else:
-                print(f"⏱️ PositionTimer: на старте позиции нет, таймер не активирован")
+                    print(f"⏱️ PositionTimer запущен (позиция восстановлена)")
     except Exception as e:
-        print(f"⚠️ Ошибка при восстановлении таймера позиции на старте: {e}")
+        print(f"⚠️ Ошибка восстановления таймера: {e}")
 
-    # --- Новости при старте ---
+    # Новости при старте
     startup_news = get_fundamental_news()
     if startup_news:
-        print(
-            f"📰 Новости при запуске: {len(startup_news)} символов из {NEWS_FILE}")
+        print(f"📰 Новости: {len(startup_news)} символов")
         rules_startup = parse_trading_rules_from_news()
         initial_bias = rules_startup["bias"]
-        news_context = {
-            "bias": initial_bias,
-            "summary": startup_news[:200] if startup_news else "Новостей нет"
-        }
-        print(f"🧠 Начальный BIAS из файла: {initial_bias.upper()}")
-        print(f"📰 Краткое содержание новостей: {news_context['summary']}")
+        news_context = {"bias": initial_bias, "summary": startup_news[:200] if startup_news else ""}
+        print(f"🧠 Начальный BIAS: {initial_bias.upper()}")
     else:
-        print("📰 Новости при запуске: файл пуст или отсутствует, фундаментал отключен.")
+        print("📰 Новости: файл пуст")
 
-    # --- Главный цикл ---
+    # Главный цикл
     while True:
         now_msk = dt.datetime.now(pytz.timezone('Europe/Moscow'))
         is_open, status_msg = get_market_status()
 
         if not is_open:
+            # Используем глобальную переменную для контроля логов сна
             global last_sleep_log_time
-
             now_utc = dt.datetime.now(dt.timezone.utc)
-            # логируем не чаще, чем раз в 3 часа
-            if (
-                last_sleep_log_time is None
-                or (now_utc - last_sleep_log_time).total_seconds() >= 3 * 3600
-            ):
-                print(f"{status_msg}. Бот спит, рынок закрыт.")
+            
+            if last_sleep_log_time is None or (now_utc - last_sleep_log_time).total_seconds() >= 3 * 3600:
+                print(f"😴 {status_msg}. Бот в режиме ожидания.")
                 last_sleep_log_time = now_utc
-
-            time.sleep(60)
+                
+            await asyncio.sleep(60) # <--- ТЕПЕРЬ ПРАВИЛЬНО
             continue
 
-
-        # Если мы здесь - рынок открыт (будни или суббота)
-        print(f"✅ {status_msg} | Интерация цикла начала работы...")
+        # Рынок открыт
+        print(f"✅ {status_msg} | Цикл начинается...")
         try:
-            print("DEBUG: Начало итерации цикла")
             cycle += 1
             print(f"\n⏳ --- {cycle:06d} ---")
 
@@ -1275,7 +1299,6 @@ async def main_loop():
 
             # 1. Позиция
             pos = await get_position_data_safe(executor, FIGI_NRZ5, retries=3)
-
             lots = pos["lots"]
             avg_price = pos["average_price"]
             if lots != 0:
@@ -1285,7 +1308,7 @@ async def main_loop():
             print("⚙️ Анализ...")
             candles = await executor.get_candles(FIGI_NRZ5)
             if candles.empty:
-                print("⚠️ Нет данных свечей, ждем...")
+                print("⚠️ Нет свечей, ждем...")
                 await asyncio.sleep(10)
                 continue
 
@@ -1294,34 +1317,28 @@ async def main_loop():
             atr = float(data.get("ATR", 0.0))
             print(f"✅ Цена: {price:.3f} | RSI: {data['RSI']:.1f}")
 
-            # 2a. Свечи 5m для тренда
+            # 2a. Свечи 5m для тренда (упрощенно)
             candles_5m = await executor.get_candles_5m(FIGI_NRZ5)
-
-            # --- Momentum 24h по 5m-свечам ---
+            
             momentum_24h = 0.0
             try:
                 if len(candles_5m) >= 288:
                     current_price_5m = float(candles_5m["close"].iloc[-1])
                     price_24h_ago_5m = float(candles_5m["close"].iloc[-288])
-                    momentum_24h = (current_price_5m /
-                                    price_24h_ago_5m - 1.0) * 100.0
+                    momentum_24h = (current_price_5m / price_24h_ago_5m - 1.0) * 100.0
                     print(f"📊 Momentum 24h: {momentum_24h:+.2f}%")
             except Exception as e:
-                print(f"⚠️ Ошибка расчёта momentum_24h: {e}")
+                print(f"⚠️ Ошибка momentum: {e}")
                 momentum_24h = 0.0
 
             if candles_5m.empty or len(candles_5m) < 200:
                 trend_5m = "FLAT"
             else:
-                candles_5m["SMA50"] = candles_5m["close"].rolling(
-                    window=50).mean()
-                candles_5m["SMA200"] = candles_5m["close"].rolling(
-                    window=200).mean()
+                candles_5m["SMA50"] = candles_5m["close"].rolling(window=50).mean()
+                candles_5m["SMA200"] = candles_5m["close"].rolling(window=200).mean()
                 last_row_5m = candles_5m.iloc[-1]
                 sma50_5m = float(last_row_5m["SMA50"])
                 sma200_5m = float(last_row_5m["SMA200"])
-                sma_diff = abs(sma50_5m - sma200_5m) / \
-                    sma200_5m * 100.0 if sma200_5m != 0 else 0.0
 
                 if price > sma50_5m and sma50_5m > sma200_5m:
                     base_trend = "UPTREND"
@@ -1337,18 +1354,9 @@ async def main_loop():
                         trend_5m = "DOWNTREND"
                     else:
                         trend_5m = "FLAT"
-                elif base_trend == "UPTREND":
-                    if momentum_24h < -8:
-                        trend_5m = "DOWNTREND"
-                    else:
-                        trend_5m = "UPTREND"
-                elif base_trend == "DOWNTREND":
-                    if momentum_24h > 8:
-                        trend_5m = "UPTREND"
-                    else:
-                        trend_5m = "DOWNTREND"
+                else:
+                    trend_5m = base_trend
 
-                
             print(f"📊 Тренд 5m: {trend_5m}")
 
             # 3. PnL
@@ -1360,34 +1368,21 @@ async def main_loop():
 
             # 4. SL/TP
             stop_price = None
-            tp1_price = None
-            tp2_price = None
             if lots > 0 and avg_price > 0 and atr > 0:
                 stop_price_raw = avg_price - 2.0 * atr
                 stop_price_min = avg_price * 0.95
                 stop_price = min(stop_price_raw, stop_price_min)
-                tp1_price = avg_price + 1.5 * atr
-                tp2_price = avg_price + 3.0 * atr
 
-            # 5. Дневное изменение и экспирация
+            # 5. Дневное изменение и Экспирация
             daily_change = calc_daily_change(candles)
-            daily_change_abs = abs(daily_change)
             exp_date = await executor.get_future_expiration(FIGI_NRZ5)
-            days_to_expiration = (
-                (exp_date - dt.datetime.now(dt.timezone.utc)).total_seconds() / 86400.0
-                if exp_date
-                else 999.0
-            )
+            days_to_expiration = (exp_date - dt.datetime.now(dt.timezone.utc)).total_seconds() / 86400.0 if exp_date else 999.0
 
-            # 5.3. Получить метрики времени для новой логики фиксации
+            # 5.3. Метрики времени
             minutes_to_clearing = get_minutes_to_clearing()
             holding_hours = position_timer.get_holding_hours()
-           
-            if cycle % 10 == 0 and lots > 0:
-                print(
-                    f"⏱️ Метрики: holding={holding_hours:.1f}ч | до клиринга={minutes_to_clearing}мин")
 
-            # 5.4. Проверка новых правил фиксации (ПРИОРИТЕТ 2-4)
+            # 5.4. Ранние выходы (SELL_ALL, SELL_HALF)
             early_exit_action: Optional[str] = None
             early_exit_reason: str = ""
 
@@ -1397,8 +1392,7 @@ async def main_loop():
 
             elif minutes_to_clearing <= 60:
                 clearing_action = check_clearing_profit_take(
-                    lots, pnl_pct, minutes_to_clearing,
-                    trend_5m, "HOLD", 0
+                    lots, pnl_pct, minutes_to_clearing, trend_5m, "HOLD", 0
                 )
                 if clearing_action:
                     early_exit_action = clearing_action
@@ -1411,499 +1405,166 @@ async def main_loop():
             if early_exit_action and lots > 0:
                 if early_exit_action == "SELL_ALL":
                     qty = lots
-                    ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)")
+                    ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"Early exit | {early_exit_reason}")
                     if ok:
-                        await send_telegram(
-                            f"🎯 {early_exit_reason} по NRZ5: SELL {qty} @ {price:.3f}\n"
-                            f"PnL: {pnl_pct:+.2f}% | Holding: {holding_hours:.1f}ч"
-                        )
-                        await log_trade(
-                            action=early_exit_reason,
-                            figi=FIGI_NRZ5,
-                            lots_before=lots,
-                            lots_after=0,
-                            price=price,
-                            signal=early_exit_reason,
-                            confidence=100.0,
-                            reason=f"{early_exit_reason}: PnL={pnl_pct:+.2f}%, holding={holding_hours:.1f}h",
-                        )
+                        await send_telegram(f"🎯 {early_exit_reason}: SELL {qty} @ {price:.3f}")
                         trailing_manager = None
                         position_timer.reset()
                         lots = 0
 
                 elif early_exit_action == "SELL_HALF":
                     qty = max(1, lots // 2)
-                    ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)")
+                    ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"Early exit | {early_exit_reason}")
                     if ok:
-                        await send_telegram(
-                            f"💰 {early_exit_reason} по NRZ5: SELL {qty} @ {price:.3f}\n"
-                            f"PnL: {pnl_pct:+.2f}% | Остаток: {lots - qty} лотов"
-                        )
-                        await log_trade(
-                            action=early_exit_reason,
-                            figi=FIGI_NRZ5,
-                            lots_before=lots,
-                            lots_after=lots - qty,
-                            price=price,
-                            signal=early_exit_reason,
-                            confidence=100.0,
-                            reason=f"{early_exit_reason}: partial, PnL={pnl_pct:+.2f}%",
-                        )
+                        await send_telegram(f"💰 {early_exit_reason}: SELL {qty} @ {price:.3f}")
                         lots -= qty
                         if trailing_manager:
                             breakeven_price = trailing_manager.entry_price * 1.003
                             if breakeven_price > trailing_manager.trailing_stop:
                                 trailing_manager.trailing_stop = breakeven_price
-                                print(
-                                    f"🔒 Trailing Stop подтянут в безубыток: {breakeven_price:.4f} (+0.3%)")
 
-                print(
-                    f"⏳ Цикл {cycle} завершён по {early_exit_reason} | price={price:.3f} | lots={lots}")
-                
-            # ========== STARTUP FIX: восстановить трейлинг, если позиция открыта но менеджер = None ==========
+                print(f"⏳ Цикл {cycle} завершен по {early_exit_reason}")
+
+            # Восстановление trailing stop
             if lots != 0 and trailing_manager is None and avg_price > 0 and atr > 0:
                 if lots > 0:
                     trailing_manager = TrailingStopManager(entry_price=avg_price, atr=atr, trend=trend_5m)
                     print(f"✅ Трейлинг восстановлен: LONG @ {avg_price:.4f}")
-                else:
-                    trailing_manager = TrailingStopManagerShort(entryprice=avg_price, atr=atr, trend=trend_5m)
 
-                    print(f"✅ Трейлинг восстановлен: SHORT @ {avg_price:.4f}")
-                if position_timer.entry_time is None:
-                    position_timer.start()
-                    
-            print(f"DEBUG TRAILING: lots={lots}, tm={'EXISTS' if trailing_manager else 'NONE'}, avgprice={avg_price:.4f}, atr={atr:.4f}")
+            print(f"DEBUG TRAILING: lots={lots}, tm={'EXISTS' if trailing_manager else 'NONE'}")
 
-                        # === ВОТ ЭТИ 3 СТРОКИ ВСТАВЛЯЕШЬ СЮДА ===
-            print(f"⏳ Итерация {cycle} завершена. Спим 60 секунд...")
-            await asyncio.sleep(60)
-
-            if early_exit_action:
-                pass
-            else:
-                # 5.5. Проверка Trailing Stop (ПРИОРИТЕТ 2)
-                # ========== 5.5. TRAILING STOP LOGIC ==========
+            if not early_exit_action:
+                # 5.5. Trailing Stop Logic
                 trailing_stop_triggered = False
 
                 if lots != 0 and trailing_manager is not None:
                     should_exit = trailing_manager.update(price, trend_5m)
-
                     if should_exit:
                         trailing_stop_triggered = True
-
-                        if lots > 0:
-                            direction = "SELL"
-                            qty = lots
-                            msg_side = "LONG"
-                            extra = f"Entry {trailing_manager.entryprice:.4f}, Max {trailing_manager.maxprice:.4f}"
-                        else:
-                            direction = "BUY"
-                            qty = abs(lots)
-                            msg_side = "SHORT"
-                            extra = f"Entry {trailing_manager.entryprice:.4f}, Min {trailing_manager.minprice:.4f}"
-
-                        ok = await post_order_guarded(
-                            executor,
-                            FIGI_NRZ5,
-                            direction,
-                            qty,
-                            why=f"TRAILING_STOP | AI={signal}({confidence}%)",
-                        )
-
+                        direction = "SELL" if lots > 0 else "BUY"
+                        qty = abs(lots)
+                        ok = await post_order_guarded(executor, FIGI_NRZ5, direction, qty, why="TRAILING_STOP")
                         if ok:
-                            await send_telegram(
-                                f"🧯 Trailing Stop {msg_side} NRZ5: {direction} {qty} @ {price:.3f} | {extra}"
-                            )
-                            await log_trade(
-                                action="TRAILING_STOP",
-                                figi=FIGI_NRZ5,
-                                lots_before=lots,
-                                lots_after=0,
-                                price=price,
-                                signal=signal,
-                                confidence=100.0,
-                                reason=f"Trailing stop fired. {extra}",
-                            )
+                            trailing_manager = None
+                            position_timer.reset()
+                            lots = 0
+                            print(f"⏳ Цикл {cycle} завершен по trailing-stop")
 
-                        trailing_manager = None
-                        position_timer.reset()
-                        lots = 0
-                        print(f"⏳ Цикл {cycle} завершён по trailing-stop | price={price:.3f}")
-                
-                        # === Пауза после ИТЕРАЦИИ, если был ранний выход ===
-                        print(f"⏳ Цикл {cycle} завершён, спим 60 секунд...")
-                        await asyncio.sleep(60)
-                        continue        
+                if not trailing_stop_triggered:
+                    # --- [ПОЛНОСТЬЮ АВТОНОМНЫЙ БЛОК: НОВОСТИ + AI] ---
+                    rules_current = {}
+                    current_news_context = "Нет данных"
+                    action_blocked_by_commission = False  # Гарантируем наличие
 
-
-
-                # ============================================================================
-                # ✅ AI АНАЛИЗ - НА ОДНОМ УРОВНЕ С TRAILING STOP!
-                # (Не внутри if trailing_stop_triggered!)
-                # ============================================================================
-
-                if not trailing_stop_triggered:  
-                    # --- [ОБНОВЛЕННЫЙ ГИБРИДНЫЙ СБОР НОВОСТЕЙ] ---
-                    # 1. Читаем ручной файл (приоритет)
-                    manual_news = get_fundamental_news()
-                    
-                    # 2. Тянем свежие новости из API (Finnhub + NewsAPI)
-                    now_utc = dt.datetime.now(dt.timezone.utc)
-                    if last_api_news_time is None or (now_utc - last_api_news_time).total_seconds() > 1200:
-                        cached_api_news = await news_agent.get_aggregated_sentiment_context()
-                        last_api_news_time = now_utc
-                    api_news = cached_api_news
-                    
-                    # 3. Формируем финальный контекст для Planner/Analyst
-                    # Если в файле пусто, используем данные из API
-                    current_news_context = manual_news if len(manual_news) > 10 else api_news
-                    
-                    # 4. Обновляем правила на основе контекста
-                    rules_current = parse_trading_rules_from_news() # Для лимитов цен
-                    current_bias = rules_current["bias"]
-                    
-                    # 5. Если в файле NEUTRAL, Planner может передумать на основе API_NEWS
-                    # Здесь можно добавить вызов planner.create_daily_plan(current_news_context)
-                    # ---------------------------------------------
-
-            if current_bias == "neutral":
-                if momentum_24h > 8.0:
-                    current_bias = "bullish"
-                elif momentum_24h < -8.0:
-                    current_bias = "bearish"
-
-
-                    print(f"🧭 Текущий BIAS: {current_bias.upper()}")
-
-                    # ========== AI ANALYSIS - CLEAN MAPPING + ASYNC ==========
-                    ai_input_clean = {
-                        "ticker": "NRZ5",
-                        "close": float(price),
-                        "Kalman_Trend": data.get("Kalman_Trend", data.get("kalman_trend", "FLAT")),
-                        "Kalman_Price": data.get("Kalman_Price", data.get("kalman_price", 0.0)),
-                        "RSI": float(data.get("RSI", 50)),
-                        "SMA_50": float(data.get("SMA_50", data.get("sma_50", 0.0))),
-                        "BB_Width": float(data.get("BB_Width", data.get("bb_width", 0.0))),
-                    }
-
-                    print(
-                        f"🔄 AI запрос: bias={current_bias}, RSI={ai_input_clean['RSI']:.1f}, "
-                        f"Kalman={ai_input_clean['Kalman_Trend']}"
-                    )
-
-                    # ✅ НОВОЕ: Асинхронный вызов с BIAS!
+                    # 1. Сбор новостей и BIAS
                     try:
-                        ai_result = await analyst.analyze(
-                            market_data=ai_input_clean,
-                            news_context=current_bias,
-                            bias=current_bias
-                        )
+                        manual_news = get_fundamental_news()
+                        now_utc = dt.datetime.now(dt.timezone.utc)
+                        if last_api_news_time is None or (now_utc - last_api_news_time).total_seconds() > 1200:
+                            cached_api_news = await news_agent.get_aggregated_sentiment_context()
+                            last_api_news_time = now_utc
 
-                        signal = ai_result.signal
-                        confidence = ai_result.confidence
-                        reason = ai_result.reason
-
-                        print(f"🤖 AI Decision: {signal} ({confidence}%) | {reason[:60]}...")
-                    
+                        # Жесткая очистка от словарей (dict -> str)
+                        if isinstance(manual_news, dict):
+                            news_text = str(manual_news.get('summary', manual_news))
+                        else:
+                            news_text = str(manual_news)
+                        
+                        current_news_context = news_text if len(news_text) > 10 else str(cached_api_news)
+                        
+                        rules_current = parse_trading_rules_from_news()
+                        current_bias = str(rules_current.get("bias", "neutral"))
                     except Exception as e:
-                        print(f"❌ Ошибка AI анализа: {e}")
-                        signal = "HOLD"
-                        confidence = 0
-                        reason = f"Ошибка: {str(e)[:50]}"
+                        print(f"⚠️ Ошибка новостей: {e}")
+                        current_bias = "neutral"
 
-                    # === SHADOW MODE: Логирование работы трёх агентов ===
-                    try:
-                        shadow_market_data = {
-                        "close": price,
-                        "RSI": float(data.get("RSI", 50)),
-                        "ATR": atr,
-                        "trend_5m": trend_5m,
-                        "momentum_24h": momentum_24h,
-                        "trend_h1": data.get("trend_h1", "FLAT"),
-                        "ai_signal": signal if isinstance(signal, str) else str(signal),
-                        "ai_confidence": int(confidence) if confidence else 0,
-                        "ai_reason": reason if isinstance(reason, str) else str(reason),
-                        }
+                    # Динамический BIAS
+                    if current_bias == "neutral":
+                        if momentum_24h > 8.0: current_bias = "bullish"
+                        elif momentum_24h < -8.0: current_bias = "bearish"
+                    print(f"🧭 BIAS: {current_bias.upper()}")
 
-                        shadow_pos_data = {
-                            "lots": int(lots),
-                            "avg_price": float(avg_price),
-                            "pnl_pct": float(pnl_pct),
-                        }
-                    
-                        asyncio.create_task(
-                            runshadowanalysisnonblocking(
-                                shadowadapter,
-                                shadow_market_data,
-                                shadow_pos_data,
-                                current_bias,
-                                signal,
-                                confidence,
-                                reason,
-                            )
-                        )
-
-                    except asyncio.TimeoutError:
-                        print("⏱️ Shadow timeout (>15s) - пропущено, продолжаем...")
-                    except Exception as e:
-                        print(f"❌ Shadow Error: {e}")
-
-                    # === ПРОВЕРКА МАКСИМАЛЬНОГО РАЗМЕРА ПОЗИЦИИ ===
-                    max_lots_allowed, lots_reason = get_max_lots_allowed()
-                    if lots_reason:
-                        print(lots_reason)
-
-                    # === ПРОВЕРКА КОМИССИЙ ===
-                    action_blocked_by_commission = False
-
+                    # 2. Расчет блокировки по комиссии (возвращаем расчет внутрь)
                     if lots > 0 and 0 < pnl_pct < MIN_PROFIT_PCT:
                         if holding_hours < 0.5:
                             action_blocked_by_commission = True
-                            print(f"⏸️ PnL +{pnl_pct:.2f}% < мин.{MIN_PROFIT_PCT}% "
-                                f"и holding {holding_hours*60:.0f}мин → HOLD (жду роста)")
+                            print(f"⏸️ Комиссия: PnL {pnl_pct:.2f}% < {MIN_PROFIT_PCT}% → HOLD")
 
-                    # Вызов решателя (ОБЯЗАТЕЛЬНО добавь rules=rules_current в конец!)
-                    action = decide_action(
-                    lots=lots,                    # количество лотов сейчас
-                    max_lots_allowed=MAX_LOTS,     # ТУТ ПРОВЕРЬ: может у тебя MAX_LOTS?
-                    ai_signal=signal,             # сигнал от AI
-                    ai_confidence=confidence,     # уверенность AI
-                    trend_5m=trend_5m,            # тренд
-                    rsi=data['RSI'],              # ТУТ ПРОВЕРЬ: если переменной rsi нет, пиши data['RSI']
-                    bias=current_bias,            # текущий байас
-                    rules=rules_current           # правила из новостей
-                )
+                    # 3. AI АНАЛИЗ (ФИНАЛЬНОЕ РЕШЕНИЕ ОШИБКИ ТИПОВ)
+                    # Берем значения напрямую из data, чтобы не было NameError
+                    current_rsi = data.get('RSI', 50)
                     
-
-                    # === БЛОКИРОВКИ И ФИЛЬТРЫ ===
-                    action_reason = ""
-
-                    if action_blocked_by_commission and action in ("SELL_ALL", "SELL_HALF"):
-                        action_reason = f"Профит {pnl_pct:.2f}% < мин.{MIN_PROFIT_PCT}%"
-                        action = "NOOP"
-
-                    elif action == "BUY_1" and rules_current.get("max_buy_price"):
-                        if price > rules_current["max_buy_price"]:
-                            action_reason = f"Цена {price:.3f} > лимита {rules_current['max_buy_price']:.3f}"
-                            action = "NOOP"
-
-                    elif action in ("SELL_ALL", "SELL_HALF") and rules_current.get("min_sell_price"):
-                        if price < rules_current["min_sell_price"]:
-                            action_reason = f"Цена {price:.3f} < мин.порога {rules_current['min_sell_price']:.3f}"
-                            action = "NOOP"
-
-                    elif action == "BUY_1" and lots >= max_lots_allowed:
-                        action_reason = f"Лимит позиции {max_lots_allowed} лот(ов)"
-                        action = "NOOP"
-
-                    # === ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ===
-                    log_decision_block(
-                        cycle=cycle,
-                        price=price,
-                        rsi=float(data.get("RSI", 50)),
-                        trend=trend_5m,
-                        lots=lots,
-                        pnl_pct=pnl_pct,
-                        holding_hours=holding_hours,
-                        ai_signal=signal,
-                        ai_confidence=confidence,
-                        bias=current_bias,
-                        minutes_to_clearing=minutes_to_clearing,
-                        rules=rules_current,
-                        action=action,
-                        reason=action_reason
+                    market_str = (
+                        f"Ticker: NRZ5, Price: {price:.3f}, RSI: {current_rsi:.1f}, "
+                        f"Trend: {trend_5m}, Momentum: {momentum_24h:.2f}%"
                     )
-                    
-                    # Алерт на сильный сигнал, который может быть проигнорирован
-                    if confidence >= 85 and action == "NOOP":
-                        await send_telegram(
-                            f"⚠️ <b>STRONG SIGNAL IGNORED</b>\n"
-                            f"🤖 AI: {signal} ({confidence}%)\n"
-                            f"📊 RSI: {data['RSI']:.1f} | Trend: {trend_5m}\n"
-                            f"📝 Причина AI: {reason[:100]}..."
+
+                    print(f"🔄 AI запрос (текстовый режим)... BIAS: {current_bias}")
+                    try:
+                        ai_result = await asyncio.wait_for(
+                            analyst.analyze(
+                                market_data=market_str,  # Передаем строку
+                                news_context=str(current_news_context),
+                                bias=str(current_bias)
+                            ),
+                            timeout=30.0
                         )
+                        signal, confidence, reason = ai_result.signal, ai_result.confidence, ai_result.reason
+                        print(f"🤖 AI Decision: {signal} ({confidence}%)")
+                    except Exception as e:
+                        print(f"❌ Ошибка в analyst.analyze: {e}")
+                        signal, confidence, reason = "HOLD", 0, f"AI Error: {e}"
 
-                    # 7. Risk-логика и Алерты
-                    ignore_emergency = lots == 0 or avg_price <= 0 or atr <= 0
-                    action_from_risk: Optional[Literal["SELL_1", "SELL_ALL"]] = None
 
+
+                    # 4. Решение и Лимиты
+                    max_lots_allowed, _ = get_max_lots_allowed()
+                    action = decide_action(
+                        lots=lots, max_lots_allowed=max_lots_allowed,
+                        ai_signal=signal, ai_confidence=confidence,
+                        trend_5m=trend_5m, rsi=data.get('RSI', 50),
+                        bias=current_bias, rules=rules_current
+                    )
+
+                    # 5. Блокировки и Риски
+                    action_reason = ""
+                    if action == "BUY_1" and lots >= max_lots_allowed:
+                        action, action_reason = "NOOP", f"Лимит {max_lots_allowed} лотов"
+                    elif action_blocked_by_commission and action in ("SELL_ALL", "SELL_HALF"):
+                        action, action_reason = "NOOP", "Блокировка комиссией"
+
+                    # 6. Экстренный выход
                     if lots > 0 and avg_price > 0 and atr > 0:
-                        emergency_exit = (avg_price - price) >= 2.0 * atr
-                        if not ignore_emergency and emergency_exit:
-                            msg = f"🚨 <b>EMERGENCY EXIT</b>\nЦена упала ниже 2*ATR от входа!"
-                            await send_telegram(msg)
-                            action_from_risk = "SELL_ALL"
-                        elif stop_price is not None and price <= stop_price:
-                            await send_telegram(f"🛑 <b>STOP-LOSS</b>\nСработал общий стоп по цене {price}")
-                            action_from_risk = "SELL_ALL"
-
-                    # Алерт на сильный проигнорированный сигнал (для отладки стратегии)
-                    if confidence >= 85 and action == "NOOP":
-                        await send_telegram(f"⚠️ <b>STRONG SIGNAL IGNORED</b>\nAI: {signal} ({confidence}%)\nПричина AI: {reason[:100]}...")
-
-                    # 8. Исполнение
-                    if action_from_risk == "SELL_ALL":
-                        qty = abs(lots)
-                        if qty > 0:
-                            ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why="Risk Exit")
+                        if (avg_price - price) >= 2.0 * atr or (stop_price and price <= stop_price):
+                            print("🚨 EMERGENCY EXIT!")
+                            ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", abs(lots), why="Risk Exit")
                             if ok:
-                                # Лог и сброс таймеров уже внутри вашего кода...
-                                await send_telegram(f"📉 <b>RISK EXIT ИСПОЛНЕН:</b> SELL {qty} @ {price:.3f}")
-                                trailing_manager = None
+                                action, action_reason = "SELL_ALL", "RISK_EXIT_EXECUTED"
+                                trailing_manager, lots = None, 0
                                 position_timer.reset()
 
-                    elif action in ("OPEN_LONG", "ADD_LONG", "OPEN_SHORT", "ADD_SHORT", "CLOSE_LONG", "CLOSE_SHORT"):
-                        # Определяем направление и количество
-                        direction = "BUY" if "LONG" in action or "CLOSE_SHORT" in action else "SELL"
-                        qty = 1 if "ADD" in action or "OPEN" in action else abs(lots)
-                        
-                        ok = await post_order_guarded(executor, FIGI_NRZ5, direction, qty, why=f"{action} (AI: {confidence}%)")
-                        
-                        if ok:
-                            # Уведомление об успешном действии стратегии
-                            icon = "🟢" if direction == "BUY" else "🔴"
-                            await send_telegram(f"{icon} <b>{action}:</b> {direction} {qty} @ {price:.3f}\nAI: {signal} ({confidence}%)")
-                            
-                            # Обновление менеджеров (как в вашем оригинальном коде)
-                            if "OPEN" in action:
-                                position_timer.start()
-                                if "LONG" in action:
-                                    trailing_manager = TrailingStopManager(entry_price=price, atr=atr, trend=trend_5m)
-                                else:
-                                    trailing_manager = TrailingStopManagerShort(entry_price=price, atr=atr, trend=trend_5m)
-                            elif "CLOSE" in action:
-                                trailing_manager = None
-                                position_timer.reset()
+                    # 7. ФИНАЛЬНОЕ ЛОГИРОВАНИЕ
+                    log_decision_block(
+                        cycle=cycle, price=price, rsi=data.get('RSI', 50),
+                        trend=trend_5m, lots=lots, pnl_pct=pnl_pct,
+                        holding_hours=holding_hours, ai_signal=signal,
+                        ai_confidence=confidence, bias=current_bias,
+                        minutes_to_clearing=minutes_to_clearing,
+                        rules=rules_current, action=action,
+                        reason=action_reason if action_reason else reason
+                    )
 
 
-                    #    if action == "NOOP":
-                    #        status = "ДЕРЖИМ" if lots != 0 else "NOOP"
-                    #        print(f"⏳ Цикл {cycle} | {status} | lots={lots} | price={price:.3f} | "
-                    #              f"RSI={data['RSI']:.1f} | trend={trend_5m} | "
-                    #              f"bias={current_bias} | AI={signal}({confidence}%) | "
-                    #              f"momentum_24h={momentum_24h:+.2f}%")
 
-                        elif action == "BUY_1":
-                            if lots < 0:
-                                qty = abs(lots)
-                                ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)")
-                                if ok:
-                                    await send_telegram(f"🟢 Закрытие шорта по NRZ5: BUY {qty} @ {price:.3f}")
-                                    await log_trade(
-                                        action="CLOSE_SHORT",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=0,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-
-                            elif 0 <= lots < MAX_LOTS:
-                                ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)")
-                                if ok:
-                                    if lots == 0:
-                                        trailing_manager = TrailingStopManager(
-                                            entry_price=price,
-                                            atr=atr,
-                                            trend=trend_5m,
-                                        )
-                                        position_timer.start()
-
-                                        await send_telegram(
-                                            f"🟢 Открытие LONG по NRZ5: BUY 1 @ {price:.3f} "
-                                            f"(AI {signal}, {confidence:.0f}%)"
-                                        )
-                                        lots_after = lots + 1
-                                        await log_trade(
-                                            action="OPEN_LONG",
-                                            figi=FIGI_NRZ5,
-                                            lots_before=lots,
-                                            lots_after=lots_after,
-                                            price=price,
-                                            signal=signal,
-                                            confidence=confidence,
-                                            reason=reason,
-                                        )
-                                    else:
-                                        await send_telegram(
-                                            f"🟢 Добор LONG по NRZ5: BUY 1 @ {price:.3f} "
-                                            f"(lots -> {lots + 1}, AI {signal}, {confidence:.0f}%)"
-                                        )
-                                        lots_after = lots + 1
-                                        await log_trade(
-                                            action="ADD_LONG",
-                                            figi=FIGI_NRZ5,
-                                            lots_before=lots,
-                                            lots_after=lots_after,
-                                            price=price,
-                                            signal=signal,
-                                            confidence=confidence,
-                                            reason=reason,
-                                        )
-
-                        elif action == "SELL_ALL":
-                            if lots > 0:
-                                qty = lots
-                                ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)")
-                                if ok:
-                                    await send_telegram(
-                                        f"📉 Полный выход по AI по NRZ5: SELL {qty} @ {price:.3f} "
-                                        f"(AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="CLOSE_ALL_AI",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=0,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-                                    trailing_manager = None
-                                    position_timer.reset()
-
-                       # if action != "NOOP":
-                       #      print(f"⏳ Цикл {cycle} | ACTION={action} | lots={lots} | "
-                       #         f"price={price:.3f} | RSI {data['RSI']:.1f} | {signal} ({confidence}%)")
-                    # --- [ФИНАЛЬНЫЙ ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ЦИКЛА] ---
-        except Exception as e:
-            error_msg = f"💥 <b>ГЛОБАЛЬНАЯ ОШИБКА ЦИКЛА</b>\n<code>{str(e)[:500]}</code>"
-            print(error_msg)
-            await send_telegram(error_msg) # Обязательно шлем алерт о падении цикла
-            await asyncio.sleep(CHECK_INTERVAL_SEC)
-
-        # ВСТАВЛЯТЬ ТУТ (ВНЕ EXCEPT, НО ВНУТРИ WHILE TRUE)
-        # === СИСТЕМА УПРАВЛЕНИЯ ПАУЗАМИ (СТРОГО МСК ПО ТЗ) ===
-        is_open_final, status_msg_final = get_market_status()
-        moscow_tz = pytz.timezone('Europe/Moscow')
-        now_msk = dt.datetime.now(moscow_tz)
-
-        if is_open_final:
-            # ПУНКТ 1: Рынок открыт (Пн-Сб, 08:50-23:50) -> Пауза 60 секунд
+            # Пауза 60 секунд после завершения цикла
+            print(f"⏳ Итерация {cycle} завершена. Спим 60 секунд...")
             await asyncio.sleep(60)
-        
-        elif now_msk.weekday() == 6:
-            # ПУНКТ 3: Воскресенье. Спим 5 минут, пишем в лог раз в 3 часа
-            if now_msk.hour % 3 == 0 and now_msk.minute < 5:
-                print(f"💤 [{now_msk.strftime('%H:%M')}] Воскресенье: режим ожидания (лог раз в 3ч)")
-            await asyncio.sleep(300)
-            
-        else:
-            # ПУНКТ 2: Клиринг или Ночь (Пн-Сб)
-            if "КЛИРИНГ" in status_msg_final:
-                print(f"☕ [{now_msk.strftime('%H:%M')}] Пауза: КЛИРИНГ. Ждем...")
-                await asyncio.sleep(30)
-            else:
-                # Обычная ночь Пн-Сб
-                if now_msk.minute == 0:
-                    print(f"🌙 [{now_msk.strftime('%H:%M')}] Рынок закрыт. Ждем открытия в 08:50.")
-                await asyncio.sleep(60)
 
-
-
+        except Exception as e:
+            print(f"❌ Critical error in main_loop: {e}")
+            import traceback
+            traceback.print_exc()
+            await asyncio.sleep(10)
 
 if __name__ == "__main__":
     asyncio.run(main_loop())
