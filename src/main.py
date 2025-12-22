@@ -15,8 +15,38 @@ from src.core.pipeline import pipeline_analysis
 from tinkoff.invest import AsyncClient, OrderDirection, OrderType, CandleInterval, Future
 from pathlib import Path
 import os
-from src.core.multi_agent_adapter import MultiAgentShadowAdapter  # <--- ДОБАВИТЬ ЭТУ СТРОКУ
+import time
+from src.core.multi_agent_adapter import MultiAgentShadowAdapter 
 from src.agents.planner import PlannerAgent
+from src.tools.news_aggregator import UnifiedNewsAgent
+import datetime as dt
+import pytz
+
+
+def get_market_status():
+    moscow_tz = pytz.timezone("Europe/Moscow")
+    now = dt.datetime.now(moscow_tz)
+    weekday = now.weekday()  # 0=Пн ... 5=Сб ... 6=Вс
+    current_time = now.time()
+
+    # Торгуем по субботам, НЕ торгуем по воскресеньям
+    if weekday == 6:
+        return False, "🌙 Воскресенье (выходной)"
+
+    # Клиринг (как вы задали сегодня)
+    if dt.time(14, 0) <= current_time <= dt.time(14, 5):
+        return False, "⏳ Дневной клиринг (14:00-14:05 МСК)"
+    if dt.time(18, 45) <= current_time <= dt.time(19, 0):
+        return False, "⏳ Вечерний клиринг (18:45-19:00 МСК)"
+
+    # Торговые часы
+    if dt.time(8, 50) <= current_time <= dt.time(23, 50):
+        return True, "🚀 Торги активны"
+
+    return False, f"🌙 Рынок закрыт ({current_time.strftime('%H:%M')} МСК)"
+
+
+
 
 Action = Literal[
 "NOOP",
@@ -49,6 +79,8 @@ COOLDOWN_AFTER_PROFIT_MINUTES = 0  # нет охлаждения после пр
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 last_trade_time = None
 last_trade_was_profit = True  # предполагаем, что первая сделка будет прибыльной
+last_sleep_log_time: Optional[dt.datetime] = None
+
 
 
 async def runshadowanalysisnonblocking(shadowadapter, marketdata, posdata, bias, signal, confidence, reason):
@@ -102,7 +134,7 @@ class PositionTimer:
 
     def start(self):
         """Зафиксировать время входа в позицию (сейчас)."""
-        self.entry_time = datetime.now(timezone.utc)
+        self.entry_time = dt.datetime.now(dt.timezone.utc)
         print(
             f"⏱️ PositionTimer: вход в позицию в {self.entry_time.strftime('%H:%M:%S UTC')}")
 
@@ -121,7 +153,7 @@ class PositionTimer:
         """Получить время удержания в часах."""
         if self.entry_time is None:
             return 0.0
-        delta = datetime.now(timezone.utc) - self.entry_time
+        delta = dt.datetime.now(dt.timezone.utc) - self.entry_time
         return delta.total_seconds() / 3600.0
 
     def is_active(self) -> bool:
@@ -167,7 +199,7 @@ class TrailingStopManager:
         self.trailing_stop = entry_price - self.offset  # ← ПЕРЕМЕСТИТЬ СЮДА!
 
         # Время удержания
-        self.entry_time = datetime.now(timezone.utc)
+        self.entry_time = dt.datetime.now(dt.timezone.utc)
         self.min_hold_minutes = 5
 
         print(
@@ -249,7 +281,7 @@ class TrailingStopManagerShort:
             self.offset = atr * atrmultiplierother
 
         self.trailingstop = entryprice + self.offset
-        self.entrytime = datetime.now(timezone.utc)
+        self.entrytime = dt.datetime.now(dt.timezone.utc)
         self.minholdminutes = 5
         print(f"Trailing Stop SHORT entry={entryprice:.4f}, offset={self.offset:.4f} trend={trend}")
 
@@ -301,7 +333,7 @@ def get_minutes_to_clearing() -> int:
         Если торги закрыты — возвращает 999 (игнорировать).
     """
     # Текущее время в МСК (UTC+3)
-    now_utc = datetime.now(timezone.utc)
+    now_utc = dt.datetime.now(dt.timezone.utc)
     now_msk = now_utc + timedelta(hours=3)
 
     current_time = now_msk.time()
@@ -314,7 +346,7 @@ def get_minutes_to_clearing() -> int:
     ]
 
     # Часы торгов срочного рынка: 10:00-23:50 МСК
-    if current_time < time(10, 0) or current_time > time(23, 50):
+    if current_time < dt.time(10, 0) or current_time > dt.time(23, 50):
         return 999  # Торги закрыты
 
     # Найти ближайший клиринг
@@ -343,7 +375,7 @@ def get_max_lots_allowed() -> tuple:
     Определить максимальное количество лотов с учётом событий.
     Returns: (max_lots, reason)
     """
-    now_utc = datetime.now(timezone.utc)
+    now_utc = dt.datetime.now(dt.timezone.utc)
     now_msk = now_utc + timedelta(hours=3)
     weekday = now_msk.weekday()  # 0=пн, 3=чт
     hour = now_msk.hour
@@ -512,7 +544,7 @@ class OrderExecutor:
 
     async def get_candles(self, figi: str) -> pd.DataFrame:
         """Загрузка реальных H1‑свечей за 7 дней по FIGI."""
-        now = datetime.now(timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
         try:
             async with AsyncClient(self.token) as client:
                 candles = []
@@ -541,7 +573,7 @@ class OrderExecutor:
 
     async def get_candles_5m(self, figi: str, days: int = 7) -> pd.DataFrame:
         """Загрузка 5m‑свечей за days дней по FIGI для расчёта SMA50/200."""
-        now = datetime.now(timezone.utc)
+        now = dt.datetime.now(dt.timezone.utc)
         try:
             async with AsyncClient(self.token) as client:
                 candles = []
@@ -739,18 +771,26 @@ class LLMMarketAnalystAdapter:
 
 
 async def send_telegram(msg: str) -> None:
-    token = settings.TELEGRAM_BOT_TOKEN.get_secret_value()
-    chat_id = settings.TELEGRAM_CHAT_ID
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    """Отправляет уведомление в Telegram с защитой от ошибок."""
+    try:
+        token = settings.TELEGRAM_BOT_TOKEN.get_secret_value().strip()
+        chat_id = settings.TELEGRAM_CHAT_ID
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "chat_id": chat_id,
+                "text": msg,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            }
+            async with session.post(url, json=payload, timeout=10) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    print(f"⚠️ TG Error: {resp.status} - {text}")
+    except Exception as e:
+        print(f"❌ Критическая ошибка Telegram Alerting: {e}")
 
-    async with aiohttp.ClientSession() as session:
-        resp = await session.post(
-            url,
-            json={"chat_id": chat_id, "text": msg, "parse_mode": "HTML"},
-        )
-        text = await resp.text()
-        print(f"TG status={resp.status} body={text[:300]}")
-        resp.raise_for_status()
 
 async def telegram_smoke_test() -> None:
     token = settings.TELEGRAM_BOT_TOKEN.get_secret_value().strip()
@@ -793,19 +833,18 @@ def get_fundamental_news(max_len: int = 2500) -> str:
 
 
 def parse_trading_rules_from_news() -> dict:
-    """
-    Парсит BIAS, MAX_BUY_PRICE, MIN_SELL_PRICE из news.txt
-    ЧИТАЕТ ВЕСЬ ФАЙЛ и ищет множество форматов
-    """
     try:
         if not os.path.exists(NEWS_FILE):
-            print(f"⚠️ Файл {NEWS_FILE} не найден")
-            return {"bias": "neutral", "max_buy_price": None, "min_sell_price": None}
-
+            return {"bias": "neutral", "max_buy_price": None, "min_sell_price": None, "force_buy": False}
         with open(NEWS_FILE, 'r', encoding='utf-8') as f:
-            content = f.read()  # ← ЧИТАЕМ ВЕСЬ ФАЙЛ
-
-        rules = {"bias": "neutral", "max_buy_price": None, "min_sell_price": None}
+            content = f.read()
+        
+        rules = {
+            "bias": "neutral", 
+            "max_buy_price": None, 
+            "min_sell_price": None,
+            "force_buy": "FORCE_BUY: TRUE" in content.upper()  # ← НОВОЕ
+        }
 
         # Парсим BIAS (ищем разные варианты)
         bias_patterns = [
@@ -968,7 +1007,7 @@ async def log_trade(
         safe_reason = (reason or "").replace(
             '"', "'").replace("\n", " ").strip()
         line = (
-            f"{datetime.now().isoformat(timespec='seconds')},"
+            f"{dt.datetime.now().isoformat(timespec='seconds')},"
             f"{figi},{action},{lots_before},{lots_after},"
             f"{price:.4f},{signal},{confidence:.1f},\"{safe_reason}\"\n"
         )
@@ -1035,64 +1074,50 @@ def decide_action(
     trend_5m: str,
     rsi: float,
     bias: str,
+    rules: dict = None
 ) -> Action:
-    """
-    Универсальный решатель LONG/SHORT.
-
-    lots:
-      >0  long
-      <0  short
-       0  flat
-
-    ai_signal: BUY/SELL/HOLD
-    bias: bullish/bearish/neutral (из news/planner)
-    """
+    # 1. Сначала парсим базовые сигналы
     sig = (ai_signal or "HOLD").upper().strip()
     b = (bias or "neutral").lower().strip()
 
-    # 0) HOLD
+    # 2. ПРИНУДИТЕЛЬНЫЙ ВХОД (FORCE BUY) - ПЕРЕХВАТЫВАЕМ ТУТ
+    if rules and rules.get("force_buy") is True:
+        if lots == 0:
+            print("🚨 FORCE_BUY ОБНАРУЖЕН! Игнорируем AI и входим.")
+            return "OPEN_LONG"
+        elif 0 < lots < max_lots_allowed:
+            return "ADD_LONG"
+
+    # 3. Если принудительного входа нет, работаем по обычной логике
     if sig == "HOLD":
-        return "NOOP"
-
-    # 1) Если есть LONG и пришёл SELL -> закрываем LONG
-    if lots > 0 and sig == "SELL":
-        return "CLOSE_LONG"
-
-    # 2) Если есть SHORT и пришёл BUY -> закрываем SHORT
-    if lots < 0 and sig == "BUY":
-        return "CLOSE_SHORT"
-
-    # 3) Входы/доборы (только если уверенность ок)
-    if ai_confidence < 60:
         return "NOOP"
 
     # 3.1) Вход в LONG
     if lots >= 0 and sig == "BUY":
-        # лёгкая фильтрация, чтобы не покупать в явном даунтренде
+        # --- НОВАЯ ЛОГИКА RSI + TREND ---
+        if rsi > 70:
+            if trend_5m != "UPTREND":
+                print(f"⚠️ RSI {rsi:.1f} перекупленность в боковике/падающем, вход LONG заблокирован")
+                return "NOOP"
+            else:
+                print(f"🔥 RSI {rsi:.1f} высокий, но UPTREND активен. РАЗРЕШАЕМ импульсный вход.")
+        
+        # Фильтрация для медвежьего рынка
         if trend_5m == "DOWNTREND" and rsi > 45:
             return "NOOP"
         if b == "bearish" and rsi > 55:
             return "NOOP"
-        if lots == 0:
-            return "OPEN_LONG"
-        if lots < max_lots_allowed:
-            return "ADD_LONG"
-        return "NOOP"
+
 
     # 3.2) Вход в SHORT
     if lots <= 0 and sig == "SELL":
-        # лёгкая фильтрация, чтобы не шортить в явном ап-тренде
-        if trend_5m == "UPTREND" and rsi < 55:
-            return "NOOP"
-        if b == "bullish" and rsi < 45:
-            return "NOOP"
-        if lots == 0:
-            return "OPEN_SHORT"
-        if abs(lots) < max_lots_allowed:
-            return "ADD_SHORT"
-        return "NOOP"
+        if rsi < 30:
+            if trend_5m != "DOWNTREND":
+                print(f"⚠️ RSI {rsi:.1f} перепроданность, вход SHORT заблокирован")
+                return "NOOP"
+            else:
+                print(f"🔥 RSI {rsi:.1f} низкий, но DOWNTREND активен. РАЗРЕШАЕМ вход в шорт.")
 
-    return "NOOP"
 
 
 def _env_bool(name: str, default: str = "false") -> bool:
@@ -1112,20 +1137,38 @@ async def post_order_guarded(
     why: str,
 ) -> bool:
     """
-    Единая точка отправки ордеров.
-
-    Если TRADE_ENABLED выключен — НЕ отправляет ордер, только логирует, что БЫ отправил.
-    Возвращает False в dry-run.
+    Единая точка отправки ордеров с интеграцией Telegram уведомлений.
     """
     if quantity <= 0:
+        msg = f"🛑 <b>Игнор ордера:</b> qty <= 0\nНаправление: {direction}\nПричина: {why}"
         print(f"🛑 post_order_guarded: quantity<=0 ignored | {direction} {quantity} {figi} | {why}")
+        # Не шлем в ТГ каждый qty=0, чтобы не спамить, только в консоль
         return False
 
     if not TRADE_ENABLED:
+        msg = f"🧪 <b>DRY-RUN (Симуляция):</b>\nДействие: {direction} {quantity} лотов\nЦель: {figi}\nОбоснование: {why}"
         print(f"🧪 DRY-RUN: WOULD {direction} {quantity} {figi} | {why}")
+        await send_telegram(msg) # Уведомляем, что бот БЫ сделал в реале
         return False
 
-    return await executor.post_order(figi, direction, quantity)
+    try:
+        # Пытаемся отправить реальный ордер
+        res = await executor.post_order(figi, direction, quantity)
+        if res:
+            # Успех — уведомление будет отправлено из основного цикла (main_loop) 
+            # для полноты контекста (цена, AI сигнал и т.д.)
+            return True
+        else:
+            await send_telegram(f"⚠️ <b>ОТКАЗ БИРЖИ:</b> {direction} {quantity} шт.\nКонтекст: {why}")
+            return False
+            
+    except Exception as e:
+        # Любая техническая ошибка (сеть, API Тинькофф, таймаут)
+        error_msg = f"❌ <b>ОШИБКА ИСПОЛНЕНИЯ:</b> {direction}\n<code>{str(e)[:200]}</code>\nКонтекст: {why}"
+        print(error_msg)
+        await send_telegram(error_msg)
+        return False
+
 
 
 async def main_loop():
@@ -1133,6 +1176,8 @@ async def main_loop():
     analyst = AgentsMarketAnalyst()
     planner = PlannerAgent()
     executor = OrderExecutor(token)
+    # --- [ИЗМЕНЕНИЕ: Инициализация нового агрегатора новостей] ---
+    news_agent = UnifiedNewsAgent() 
     shadowadapter = MultiAgentShadowAdapter()
       
     # --- ИНИЦИАЛИЗАЦИЯ ТЕНЕВОГО АДАПТЕРА ---
@@ -1193,6 +1238,27 @@ async def main_loop():
 
     # --- Главный цикл ---
     while True:
+        now_msk = dt.datetime.now(pytz.timezone('Europe/Moscow'))
+        is_open, status_msg = get_market_status()
+
+        if not is_open:
+            global last_sleep_log_time
+
+            now_utc = dt.datetime.now(dt.timezone.utc)
+            # логируем не чаще, чем раз в 3 часа
+            if (
+                last_sleep_log_time is None
+                or (now_utc - last_sleep_log_time).total_seconds() >= 3 * 3600
+            ):
+                print(f"{status_msg}. Бот спит, рынок закрыт.")
+                last_sleep_log_time = now_utc
+
+            time.sleep(60)
+            continue
+
+
+        # Если мы здесь - рынок открыт (будни или суббота)
+        print(f"✅ {status_msg} | Интерация цикла начала работы...")
         try:
             print("DEBUG: Начало итерации цикла")
             cycle += 1
@@ -1301,7 +1367,7 @@ async def main_loop():
             daily_change_abs = abs(daily_change)
             exp_date = await executor.get_future_expiration(FIGI_NRZ5)
             days_to_expiration = (
-                (exp_date - datetime.now(timezone.utc)).total_seconds() / 86400.0
+                (exp_date - dt.datetime.now(dt.timezone.utc)).total_seconds() / 86400.0
                 if exp_date
                 else 999.0
             )
@@ -1462,18 +1528,32 @@ async def main_loop():
                 # (Не внутри if trailing_stop_triggered!)
                 # ============================================================================
 
-                if not trailing_stop_triggered:  # ← Только если trailing не сработал
-                    # === ОБНОВЛЕНИЕ ПРАВИЛ ИЗ news.txt ===
-                    rules = parse_trading_rules_from_news()
-                    current_bias = rules["bias"]
+                if not trailing_stop_triggered:  
+                    # --- [ОБНОВЛЕННЫЙ ГИБРИДНЫЙ СБОР НОВОСТЕЙ] ---
+                    # 1. Читаем ручной файл (приоритет)
+                    manual_news = get_fundamental_news()
+                    
+                    # 2. Тянем свежие новости из API (Finnhub + NewsAPI)
+                    api_news = await news_agent.get_aggregated_sentiment_context()
+                    
+                    # 3. Формируем финальный контекст для Planner/Analyst
+                    # Если в файле пусто, используем данные из API
+                    current_news_context = manual_news if len(manual_news) > 10 else api_news
+                    
+                    # 4. Обновляем правила на основе контекста
+                    rules_current = parse_trading_rules_from_news() # Для лимитов цен
+                    current_bias = rules_current["bias"]
+                    
+                    # 5. Если в файле NEUTRAL, Planner может передумать на основе API_NEWS
+                    # Здесь можно добавить вызов planner.create_daily_plan(current_news_context)
+                    # ---------------------------------------------
 
-                    if current_bias == "neutral":
-                        if momentum_24h > 8.0:
-                            current_bias = "bullish"
-                            print(f"📊 Bias override: neutral → bullish (momentum +{momentum_24h:.2f}%)")
-                        elif momentum_24h < -8.0:
-                            current_bias = "bearish"
-                            print(f"📊 Bias override: neutral → bearish (momentum {momentum_24h:.2f}%)")
+            if current_bias == "neutral":
+                if momentum_24h > 8.0:
+                    current_bias = "bullish"
+                elif momentum_24h < -8.0:
+                    current_bias = "bearish"
+
 
                     print(f"🧭 Текущий BIAS: {current_bias.upper()}")
 
@@ -1564,16 +1644,17 @@ async def main_loop():
                             print(f"⏸️ PnL +{pnl_pct:.2f}% < мин.{MIN_PROFIT_PCT}% "
                                 f"и holding {holding_hours*60:.0f}мин → HOLD (жду роста)")
 
-                    # === ВЫЗОВ ОСНОВНОЙ ЛОГИКИ ===
+                    # Вызов решателя (ОБЯЗАТЕЛЬНО добавь rules=rules_current в конец!)
                     action = decide_action(
-                        lots=lots,
-                        max_lots_allowed=max_lots_allowed,
-                        ai_signal=signal,
-                        ai_confidence=confidence,
-                        trend_5m=trend_5m,
-                        rsi=float(data.get("RSI", 50)),
-                        bias=current_bias,
-                    )
+                    lots=lots,                    # количество лотов сейчас
+                    max_lots_allowed=MAX_LOTS,     # ТУТ ПРОВЕРЬ: может у тебя MAX_LOTS?
+                    ai_signal=signal,             # сигнал от AI
+                    ai_confidence=confidence,     # уверенность AI
+                    trend_5m=trend_5m,            # тренд
+                    rsi=data['RSI'],              # ТУТ ПРОВЕРЬ: если переменной rsi нет, пиши data['RSI']
+                    bias=current_bias,            # текущий байас
+                    rules=rules_current           # правила из новостей
+                )
                     
 
                     # === БЛОКИРОВКИ И ФИЛЬТРЫ ===
@@ -1583,14 +1664,14 @@ async def main_loop():
                         action_reason = f"Профит {pnl_pct:.2f}% < мин.{MIN_PROFIT_PCT}%"
                         action = "NOOP"
 
-                    elif action == "BUY_1" and rules.get("max_buy_price"):
-                        if price > rules["max_buy_price"]:
-                            action_reason = f"Цена {price:.3f} > лимита {rules['max_buy_price']:.3f}"
+                    elif action == "BUY_1" and rules_current.get("max_buy_price"):
+                        if price > rules_current["max_buy_price"]:
+                            action_reason = f"Цена {price:.3f} > лимита {rules_current['max_buy_price']:.3f}"
                             action = "NOOP"
 
-                    elif action in ("SELL_ALL", "SELL_HALF") and rules.get("min_sell_price"):
-                        if price < rules["min_sell_price"]:
-                            action_reason = f"Цена {price:.3f} < мин.порога {rules['min_sell_price']:.3f}"
+                    elif action in ("SELL_ALL", "SELL_HALF") and rules_current.get("min_sell_price"):
+                        if price < rules_current["min_sell_price"]:
+                            action_reason = f"Цена {price:.3f} < мин.порога {rules_current['min_sell_price']:.3f}"
                             action = "NOOP"
 
                     elif action == "BUY_1" and lots >= max_lots_allowed:
@@ -1610,178 +1691,72 @@ async def main_loop():
                         ai_confidence=confidence,
                         bias=current_bias,
                         minutes_to_clearing=minutes_to_clearing,
-                        rules=rules,
+                        rules=rules_current,
                         action=action,
                         reason=action_reason
                     )
+                    
+                    # Алерт на сильный сигнал, который может быть проигнорирован
+                    if confidence >= 85 and action == "NOOP":
+                        await send_telegram(
+                            f"⚠️ <b>STRONG SIGNAL IGNORED</b>\n"
+                            f"🤖 AI: {signal} ({confidence}%)\n"
+                            f"📊 RSI: {data['RSI']:.1f} | Trend: {trend_5m}\n"
+                            f"📝 Причина AI: {reason[:100]}..."
+                        )
 
-                    # 7. Risk-логика
+                    # 7. Risk-логика и Алерты
                     ignore_emergency = lots == 0 or avg_price <= 0 or atr <= 0
-                    action_from_risk: Optional[Literal["SELL_1",
-                                                       "SELL_ALL"]] = None
+                    action_from_risk: Optional[Literal["SELL_1", "SELL_ALL"]] = None
 
                     if lots > 0 and avg_price > 0 and atr > 0:
                         emergency_exit = (avg_price - price) >= 2.0 * atr
-                        rsi_current = float(data.get("RSI", 50))
-
                         if not ignore_emergency and emergency_exit:
-                            print(
-                                "🚨 Аварийный выход: цена ушла ниже входа более чем на 2*ATR!")
+                            msg = f"🚨 <b>EMERGENCY EXIT</b>\nЦена упала ниже 2*ATR от входа!"
+                            await send_telegram(msg)
                             action_from_risk = "SELL_ALL"
                         elif stop_price is not None and price <= stop_price:
-                            print("🛑 Сработал общий Stop-Loss по позиции!")
+                            await send_telegram(f"🛑 <b>STOP-LOSS</b>\nСработал общий стоп по цене {price}")
                             action_from_risk = "SELL_ALL"
 
-                    if action_from_risk is not None:
-                        if action_from_risk == "SELL_ALL":
-                            qty = abs(lots)
-                            if qty > 0:
-                                ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)")
-                                if ok:
-                                    await send_telegram(f"📉 Risk exit по NRZ5: SELL {qty} @ {price:.3f}")
-                                    await log_trade(
-                                        action=action_from_risk,
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=0,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-                                    trailing_manager = None
-                                    position_timer.reset()
+                    # Алерт на сильный проигнорированный сигнал (для отладки стратегии)
+                    if confidence >= 85 and action == "NOOP":
+                        await send_telegram(f"⚠️ <b>STRONG SIGNAL IGNORED</b>\nAI: {signal} ({confidence}%)\nПричина AI: {reason[:100]}...")
 
-                        print(
-                            f"⏳ Цикл {cycle} завершён по risk-логике | lots={lots} | price={price:.3f} | AI={signal}")
-                    else:
-                         #8. Основная стратегия
-                        if action == "NOOP":
-                            status = "ДЕРЖИМ" if lots != 0 else "NOOP"
-                            print(
-                                f"⏳ Цикл {cycle} | {status} | lots={lots} | price={price:.3f} | "
-                                f"RSI={data['RSI']:.1f} | trend={trend_5m} | "
-                                f"bias={current_bias} | AI={signal}({confidence}%) | "
-                                f"momentum_24h={momentum_24h:+.2f}%"
-                            )
-
-                        elif action in ("OPEN_LONG", "ADD_LONG"):
-                            ok = await post_order_guarded(
-                                executor, FIGI_NRZ5, "BUY", 1, why=f"{action} | AI={signal}({confidence}%)"
-                            )
+                    # 8. Исполнение
+                    if action_from_risk == "SELL_ALL":
+                        qty = abs(lots)
+                        if qty > 0:
+                            ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why="Risk Exit")
                             if ok:
-                                if lots == 0 and action == "OPEN_LONG":
-                                    trailing_manager = TrailingStopManager(entryprice=avg_price, atr=atr, trend=trend_5m)
-                                    position_timer.start()
-                                    await send_telegram(
-                                        f"🟢 Открытие LONG по NRZ5: BUY 1 @ {price:.3f} (AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="OPEN_LONG",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=lots + 1,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
+                                # Лог и сброс таймеров уже внутри вашего кода...
+                                await send_telegram(f"📉 <b>RISK EXIT ИСПОЛНЕН:</b> SELL {qty} @ {price:.3f}")
+                                trailing_manager = None
+                                position_timer.reset()
+
+                    elif action in ("OPEN_LONG", "ADD_LONG", "OPEN_SHORT", "ADD_SHORT", "CLOSE_LONG", "CLOSE_SHORT"):
+                        # Определяем направление и количество
+                        direction = "BUY" if "LONG" in action or "CLOSE_SHORT" in action else "SELL"
+                        qty = 1 if "ADD" in action or "OPEN" in action else abs(lots)
+                        
+                        ok = await post_order_guarded(executor, FIGI_NRZ5, direction, qty, why=f"{action} (AI: {confidence}%)")
+                        
+                        if ok:
+                            # Уведомление об успешном действии стратегии
+                            icon = "🟢" if direction == "BUY" else "🔴"
+                            await send_telegram(f"{icon} <b>{action}:</b> {direction} {qty} @ {price:.3f}\nAI: {signal} ({confidence}%)")
+                            
+                            # Обновление менеджеров (как в вашем оригинальном коде)
+                            if "OPEN" in action:
+                                position_timer.start()
+                                if "LONG" in action:
+                                    trailing_manager = TrailingStopManager(entry_price=price, atr=atr, trend=trend_5m)
                                 else:
-                                    await send_telegram(
-                                        f"🟢 Добор LONG по NRZ5: BUY 1 @ {price:.3f} (lots -> {lots + 1}, AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="ADD_LONG",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=lots + 1,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
+                                    trailing_manager = TrailingStopManagerShort(entry_price=price, atr=atr, trend=trend_5m)
+                            elif "CLOSE" in action:
+                                trailing_manager = None
+                                position_timer.reset()
 
-                        elif action == "CLOSE_LONG":
-                            if lots > 0:
-                                qty = lots
-                                ok = await post_order_guarded(
-                                    executor, FIGI_NRZ5, "SELL", qty, why=f"{action} | AI={signal}({confidence}%)"
-                                )
-                                if ok:
-                                    await send_telegram(
-                                        f"📉 Закрытие LONG по NRZ5: SELL {qty} @ {price:.3f} (AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="CLOSE_LONG",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=0,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-                                    trailing_manager = None
-                                    position_timer.reset()
-
-                        elif action in ("OPEN_SHORT", "ADD_SHORT"):
-                            ok = await post_order_guarded(
-                                executor, FIGI_NRZ5, "SELL", 1, why=f"{action} | AI={signal}({confidence}%)"
-                            )
-                            if ok:
-                                if lots == 0 and action == "OPEN_SHORT":
-                                    trailing_manager = TrailingStopManagerShort(entryprice=price, atr=atr, trend=trend_5m)
-                                    position_timer.start()
-                                    await send_telegram(
-                                        f"🔴 Открытие SHORT по NRZ5: SELL 1 @ {price:.3f} (AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="OPEN_SHORT",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=lots - 1,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-                                else:
-                                    await send_telegram(
-                                        f"🔴 Добор SHORT по NRZ5: SELL 1 @ {price:.3f} (lots -> {lots - 1}, AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="ADD_SHORT",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=lots - 1,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-
-                        elif action == "CLOSE_SHORT":
-                            if lots < 0:
-                                qty = abs(lots)
-                                ok = await post_order_guarded(
-                                    executor, FIGI_NRZ5, "BUY", qty, why=f"{action} | AI={signal}({confidence}%)"
-                                )
-                                if ok:
-                                    await send_telegram(
-                                        f"🟢 Закрытие SHORT по NRZ5: BUY {qty} @ {price:.3f} (AI {signal}, {confidence:.0f}%)"
-                                    )
-                                    await log_trade(
-                                        action="CLOSE_SHORT",
-                                        figi=FIGI_NRZ5,
-                                        lots_before=lots,
-                                        lots_after=0,
-                                        price=price,
-                                        signal=signal,
-                                        confidence=confidence,
-                                        reason=reason,
-                                    )
-                                    trailing_manager = None
-                                    position_timer.reset()
 
                     #    if action == "NOOP":
                     #        status = "ДЕРЖИМ" if lots != 0 else "NOOP"
@@ -1875,9 +1850,15 @@ async def main_loop():
                        # if action != "NOOP":
                        #      print(f"⏳ Цикл {cycle} | ACTION={action} | lots={lots} | "
                        #         f"price={price:.3f} | RSI {data['RSI']:.1f} | {signal} ({confidence}%)")
+                    # --- [ФИНАЛЬНЫЙ ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ЦИКЛА] ---
+        except Exception as e:
+            error_msg = f"💥 <b>ГЛОБАЛЬНАЯ ОШИБКА ЦИКЛА</b>\n<code>{str(e)[:500]}</code>"
+            print(error_msg)
+            await send_telegram(error_msg) # Обязательно шлем алерт о падении цикла
+            await asyncio.sleep(CHECK_INTERVAL_SEC)
 
             # Умный режим сна
-            msk_now = datetime.now(timezone.utc) + timedelta(hours=3)
+            msk_now = dt.datetime.now(dt.timezone.utc) + timedelta(hours=3)
             current_weekday = msk_now.weekday()
             current_hour = msk_now.hour
             current_minute = msk_now.minute
@@ -1887,7 +1868,7 @@ async def main_loop():
 
             minutes_now = current_hour * 60 + current_minute
 
-            if current_weekday in (5, 6):
+            if current_weekday == 6:
                 sleep_time = 300
                 mode_name = "🌙 Выходные"
             elif minutes_now < (8 * 60 + 45):

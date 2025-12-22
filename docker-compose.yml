@@ -1,0 +1,11 @@
+services:
+  predator-bot:
+    build: .
+    container_name: predator_trading_bot
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./memory:/app/memory
+      - ./news.txt:/app/news.txt
+      - ./logs:/app/logs
