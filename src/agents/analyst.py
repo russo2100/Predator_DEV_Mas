@@ -1,117 +1,77 @@
-import json
-import re
-import asyncio
+import logging
 from typing import Dict, Any, Optional
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.config.settings import settings
 
-class AnalystResult:
-    def __init__(self, signal: str, reason: str, confidence: int, levels: Optional[Dict] = None):
-        self.signal = signal.upper()
-        self.reason = reason
-        self.confidence = min(100, max(0, confidence))
-        self.levels = levels or {}
+# Схема для гарантированного парсинга без ошибок
+class AnalysisResponse(BaseModel):
+    signal: str = Field(description="Торговый сигнал: BUY, SELL или HOLD")
+    confidence: int = Field(description="Уверенность в сигнале от 0 до 100")
+    bullish_prob: float = Field(description="Вероятность роста (0.0 - 1.0)")
+    bearish_prob: float = Field(description="Вероятность падения (0.0 - 1.0)")
+    reason: str = Field(description="Подробное обоснование решения")
 
 class MarketAnalyst:
     def __init__(self):
+        # Инициализация модели с поддержкой структурированного вывода
         self.llm = ChatOpenAI(
             model=settings.AI_MODEL_ANALYST,
             temperature=0.3,
-            api_key=settings.OPENROUTER_API_KEY,
+            api_key=settings.OPENROUTER_API_KEY.get_secret_value(),
             base_url=settings.OPENROUTER_BASE_URL,
-            model_kwargs={"response_format": {"type": "json_object"}},
+        ).with_structured_output(AnalysisResponse)
+        
+        self.logger = logging.getLogger(__name__)
+
+    def _get_master_prompt(self, bias: str) -> ChatPromptTemplate:
+        """Формирование промпта с учетом текущего BIAS и метеоданных"""
+        bias_instr = {
+            "bullish": "ПРИОРpriority: LONG. Ищи точки входа в покупку. SHORT только при явном сломе тренда.",
+            "bearish": "ПРИОРpriority: SHORT. Ищи точки входа в продажу. LONG запрещен или только как хедж.",
+            "neutral": "Рынок нейтрален. Работай по техническим уровням и RSI."
+        }.get(bias.lower(), "Действуй по ситуации.")
+
+        system_msg = (
+            "Ты — ведущий аналитик рынка природного газа (NG). Твоя цель — Hybrid Architecture v2.0.\n"
+            "Вместо однозначного выбора ты должен оценивать ВЕРОЯТНОСТИ сценариев.\n"
+            f"Текущий фундаментальный BIAS: {bias.upper()}.\n"
+            f"Инструкция: {bias_instr}\n\n"
+            "АНАЛИЗИРУЙ:\n"
+            "1. Техническую картину (RSI, Trend, Momentum).\n"
+            "2. Фундаментальный контекст (погода, HDD, запасы).\n"
+            "3. Вероятность изменения тренда (Bayesian thinking).\n\n"
+            "Выдай ответ строго в формате JSON с оценкой вероятностей для обоих направлений."
         )
 
-    def _get_master_prompt(self, bias: str) -> str:
-        bias_restriction = ""
-        if bias.lower() == "bearish":
-            bias_restriction = "🔴 РЕЖИМ: BEARISH (SHORT_ONLY). BUY КАТЕГОРИЧЕСКИ ЗАПРЕЩЕН. Только SELL или HOLD."
-        elif bias.lower() == "bullish":
-            bias_restriction = "🟢 РЕЖИМ: BULLISH (LONG_ONLY). SELL КАТЕГОРИЧЕСКИ ЗАПРЕЩЕН. Только BUY или HOLD."
-        else:
-            bias_restriction = "🟡 РЕЖИМ: NEUTRAL. Разрешены BUY, SELL и HOLD."
+        return ChatPromptTemplate.from_messages([
+            ("system", system_msg),
+            ("human", "МАРКЕТ-ДАННЫЕ: {market_data}\nНОВОСТНОЙ КОНТЕКСТ: {news_context}")
+        ])
 
-        return f"""
-# MASTER PROMPTING SYSTEM: NG TRADING AGENT v3.0
-================================================
-РОЛЬ: Senior Commodity Analyst & Algo Trader (Natural Gas Focus).
-{bias_restriction}
-
-### ТЕКУЩИЕ ДАННЫЕ (LIVE):
-- ЦЕНА: ${{price}} | RSI: {{rsi}} 
-- ТРЕНД (KALMAN): {{kalman_trend}} | MOMENTUM (24h): {{momentum_24h}}%
-
-### ИСТОЧНИКИ ДАННЫХ:
-1. NEWS_FEED: {{manual_news}} (Приоритет)
-2. MACRO_DATA: {{api_news}} (Trading Economics/EIA)
-3. BROKER_DATA: Т-Инвест/Пульс
-
-### АЛГОРИТМ RSIP (8 ШАГОВ):
-1. VALIDATION: Фильтруй шум news.txt. Ищи Level 1 события (LNG, EIA).
-2. DEEP THINK: Соотнеси запасы и погоду (La Niña). Поддержка $3.570.
-3. RSIP CRITIQUE: Найди 3 причины, почему твой план ПРОВАЛИТСЯ.
-4. RSIP REFACTOR: Перепиши решение с учетом найденных рисков.
-5. SENTIMENT: Оцени Sentiment Score (-5 до +5).
-6. RISK: SL/TP на основе ATR. Лимит сделки 2%.
-
-ВЫДАЙ ОТВЕТ СТРОГО В JSON:
-{{{{
-  "signal": "BUY/SELL/HOLD",
-  "confidence": 0-100,
-  "reason": "3 тезиса + результат RSIP критики",
-  "levels": {{{{ "entry": {{price}}, "sl": 0, "tp": 0 }}}},
-  "warning": "фактор отмены"
-}}}}
-"""
-
-    async def analyze(self, market_data: Any, news_context: str, bias: str) -> AnalystResult:
+    async def analyze(self, market_data: Any, news_context: str, bias: str) -> AnalysisResponse:
         """
-         market_data может быть строкой (из нашего хака) или словарем.
-         Мы безопасно вытаскиваем из него значения.
+        Основной метод анализа. 
+        Возвращает объект AnalysisResponse, что исключает ошибки атрибутов .get()
         """
-        # Безопасное извлечение данных для промпта
-        if isinstance(market_data, str):
-            # Если пришла строка, пробуем найти числа через регулярки или ставим заглушки
-            price = re.search(r"Price: ([\d.]+)", market_data)
-            rsi = re.search(r"RSI: ([\d.]+)", market_data)
-            trend = re.search(r"Trend: (\w+)", market_data)
-            mom = re.search(r"Momentum: ([\d.-]+)", market_data)
-            
-            p_val = price.group(1) if price else "N/A"
-            r_val = rsi.group(1) if rsi else "50"
-            t_val = trend.group(1) if trend else "FLAT"
-            m_val = mom.group(1) if mom else "0"
-        else:
-            # Если пришел словарь
-            p_val = market_data.get("close", "N/A")
-            r_val = market_data.get("RSI", "50")
-            t_val = market_data.get("Kalman_Trend", "FLAT")
-            m_val = market_data.get("momentum_24h", "0")
-
-        # Формируем промпт
-        prompt_text = self._get_master_prompt(bias).format(
-            price=p_val,
-            rsi=r_val,
-            kalman_trend=t_val,
-            momentum_24h=m_val,
-            manual_news=news_context,
-            api_news="EIA Reports / Weather Models"
-        )
+        prompt_template = self._get_master_prompt(bias)
+        chain = prompt_template | self.llm
 
         try:
-            # Вызов LLM
-            response = await self.llm.ainvoke(prompt_text)
-            content = response.content
-            
-            # Парсим JSON
-            data = json.loads(content)
-            return AnalystResult(
-                signal=data.get("signal", "HOLD"),
-                reason=data.get("reason", "No reason provided"),
-                confidence=data.get("confidence", 0),
-                levels=data.get("levels", {})
-            )
+            # Прямой вызов возвращает уже валидированный объект AnalysisResponse
+            result = await chain.ainvoke({
+                "market_data": str(market_data),
+                "news_context": news_context
+            })
+            return result
         except Exception as e:
-            print(f"❌ Analyst AI Error: {e}")
-            return AnalystResult("HOLD", f"AI Analysis failed: {e}", 0)
+            self.logger.error(f"Критическая ошибка AI анализа: {e}")
+            # Safe Fallback в случае сбоя сети или API
+            return AnalysisResponse(
+                signal="HOLD",
+                confidence=0,
+                bullish_prob=0.5,
+                bearish_prob=0.5,
+                reason=f"Safe Fallback: {str(e)}"
+            )

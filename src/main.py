@@ -7,7 +7,7 @@ import uuid
 import aiohttp
 from typing import Dict, Any, Literal, Optional
 from datetime import datetime, timedelta, timezone, time
-from src.agents.analyst import MarketAnalyst as AgentsMarketAnalyst
+from src.agents.analyst import MarketAnalyst
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.config.settings import settings
@@ -21,6 +21,7 @@ from src.agents.planner import PlannerAgent
 from src.tools.news_aggregator import UnifiedNewsAgent
 import datetime as dt
 import pytz
+from src.services.weather_monitor import SynopticMonitor
 
 
 
@@ -68,7 +69,7 @@ TRADE_HISTORY_PATH = BASE_DIR / "trade_history.csv"
 
 
 CHECK_INTERVAL_SEC = 60
-FIGI_NRZ5 = "FUTNGM122500"
+FIGI_NRF6 = "FUTNGM012600"
 NEWS_FILE = "news.txt"
 
 # Максимальный размер позиции в лотах (только LONG)
@@ -1090,82 +1091,75 @@ def log_decision_block(cycle: int, price: float, rsi: float, trend: str, lots: i
 
 def decide_action(
     lots: int,
-    max_lots_allowed: int,
+    max_lots: int,
     ai_signal: str,
-    ai_confidence: float,
+    ai_confidence: int,
+    bullish_prob: float,
+    bearish_prob: float,
     trend_5m: str,
     rsi: float,
     bias: str,
-    rules: dict = None
-) -> Action:
-    # 1. Нормализация входа
-    sig = (ai_signal or "HOLD").upper().strip()
-    b = (bias or "neutral").lower().strip()
-    rules = rules or {}
+    rules: Dict[str, Any]
+) -> tuple[str, str]:
+    """
+    v2.0 Hybrid Architecture Decision Engine.
+    Реализует Bayesian Scenario Engine и динамическую адаптивность.
+    """
+    # 1. Dynamic Confidence Correction (ТЗ п.3)
+    # Если в новостях/правилах есть флаг экстремальной погоды или полярного вихря
+    is_extreme = any(word in str(rules).lower() for word in ["vortex", "extreme", "arctic", "noaa"])
+    effective_confidence = ai_confidence + (20 if is_extreme else 0)
+    
+    # Снижаем порог входа для "разведки" при экстремальных событиях
+    min_entry_conf = 40 if is_extreme else 70
 
-    # 2. FORCE BUY (как у тебя было)
-    if rules.get("force_buy") is True:
-        if lots == 0:
-            print("🚨 FORCE_BUY ОБНАРУЖЕН! Игнорируем AI и входим.")
-            return "OPEN_LONG"
-        elif 0 < lots < max_lots_allowed:
-            return "ADD_LONG"
+    # 2. Обработка многовариантности (Bayesian Hedge)
+    # Если мы в медвежьем BIAS, но вероятность роста > 30% (ТЗ п.5.1)
+    is_bullish_hedge_ready = (bias == "bearish" and bullish_prob > 0.30)
+    is_bearish_hedge_ready = (bias == "bullish" and bearish_prob > 0.30)
 
-    # 3. AI слишком неуверен — ничего не делаем
-    if ai_confidence < 60:
-        return "NOOP"
+    # 3. ЛОГИКА ВХОДА (Если позиции нет)
+    if lots == 0:
+        # Сценарий LONG
+        if ai_signal == "BUY":
+            if effective_confidence >= min_entry_conf:
+                return "BUY1", f"Entry: Conf {effective_confidence}% | Bullish {bullish_prob:.2f}"
+            if is_bullish_hedge_ready and rsi < 40:
+                return "BUY1", f"Hedge Long: Prob {bullish_prob:.2f} вопреки Bias {bias}"
+        
+        # Сценарий SHORT
+        if ai_signal == "SELL":
+            if effective_confidence >= min_entry_conf:
+                return "SELL1", f"Entry: Conf {effective_confidence}% | Bearish {bearish_prob:.2f}"
+            if is_bearish_hedge_ready and rsi > 60:
+                return "SELL1", f"Hedge Short: Prob {bearish_prob:.2f} вопреки Bias {bias}"
 
-    # 4. HOLD как явный сигнал
-    if sig == "HOLD":
-        return "NOOP"
+    # 4. ЛОГИКА УПРАВЛЕНИЯ (Если позиция есть)
+    else:
+        # Проверка на мгновенный разворот (Event-Driven Rebalancer)
+        if lots > 0: # Мы в лонге
+            if bearish_prob > 0.65 or (ai_signal == "SELL" and effective_confidence > 80):
+                return "SELL_ALL", f"Emergency Rebalance: Bearish prob {bearish_prob:.2f}"
+            
+            # Частичная фиксация при ослаблении
+            if bullish_prob < 0.40 and rsi > 70:
+                return "SELL_HALF", "Partial TP: Bullish momentum weakening"
 
-    # 5. LONG‑логика (покупка)
-    if sig == "BUY" and lots >= 0:
-        # жесткий фильтр по BIAS: при явном bearish не лезем, если рынок не дикого перепродана
-        if b == "bearish" and rsi > 25:
-            return "NOOP"
+        if lots < 0: # Мы в шорте
+            if bullish_prob > 0.65 or (ai_signal == "BUY" and effective_confidence > 80):
+                return "BUY_ALL", f"Emergency Rebalance: Bullish prob {bullish_prob:.2f}"
+            
+            # Частичная фиксация при ослаблении
+            if bearish_prob < 0.40 and rsi < 30:
+                return "BUY_HALF", "Partial TP: Bearish momentum weakening"
 
-        # перекупленность без ап‑тренда не берем
-        if rsi > 70 and trend_5m != "UPTREND":
-            print(f"⚠️ RSI {rsi:.1f} перекупленность без ап‑тренда, вход LONG заблокирован")
-            return "NOOP"
+    # 5. Блокировка "зависания" (Static Bias Override)
+    # Если RSI экстремальный, а AI молчит - даем шанс на микро-вход
+    if rsi < 20 and bias == "bearish" and bullish_prob > 0.25:
+        return "BUY1", "Extreme RSI mean reversion attempt (Hedge)"
 
-        # медвежий тренд + высокий RSI — не усредняемся против движения
-        if trend_5m == "DOWNTREND" and rsi > 50:
-            return "NOOP"
+    return "NOOP", f"Waiting. B:{bullish_prob:.2f} S:{bearish_prob:.2f} RSI:{rsi:.1f}"
 
-        # ВХОД: если позы нет — открываем 1 лот
-        if lots == 0:
-            if max_lots_allowed > 0:
-                return "BUY_1"
-            return "NOOP"
-
-        # ДОБОР: есть позиция, но не превышаем лимит
-        if 0 < lots < max_lots_allowed and rsi < 60 and trend_5m in ("UPTREND", "FLAT"):
-            return "BUY_1"
-
-        return "NOOP"
-
-    # 6. SHORT/выход (SELL‑логика)
-    if sig == "SELL" and lots > 0:
-        # при явном bullish не закрываем всё сразу, если нет перекупленности
-        if b == "bullish" and rsi < 75:
-            return "NOOP"
-
-        # перепроданность без даун‑тренда — не рубим всё
-        if rsi < 30 and trend_5m != "DOWNTREND":
-            print(f"⚠️ RSI {rsi:.1f} перепроданность без даун‑тренда, полный выход заблокирован")
-            return "NOOP"
-
-        # сильный SELL — полный выход
-        if ai_confidence >= 70 or trend_5m == "DOWNTREND":
-            return "SELL_ALL"
-
-        # если уверенность поменьше — можно оставить как NOOP или SELL_HALF (если поддерживаешь)
-        return "NOOP"
-
-    # 7. Если сигналы не BUY/SELL — ничего не делаем
-    return "NOOP"
 
 
 
@@ -1221,350 +1215,144 @@ async def post_order_guarded(
 
 
 async def main_loop():
+    # Теперь это сработает для всех ключей
     token = settings.TINKOFF_TOKEN.get_secret_value()
-    analyst = AgentsMarketAnalyst()
+    
+    analyst = MarketAnalyst()
     planner = PlannerAgent()
     executor = OrderExecutor(token)
-    news_agent = UnifiedNewsAgent() 
-    shadowadapter = MultiAgentShadowAdapter()
-      
+    news_agent = UnifiedNewsAgent()
     shadow_adapter = MultiAgentShadowAdapter()
-    print("👻 Shadow Mode активирован: агенты пишут логи в shadow_agents_log.jsonl")
-    await send_telegram("✅ Predator стартовал. Telegram OK.")
+    weather_monitor = SynopticMonitor()
+
+    
+    print("👻 Hybrid Architecture v2.0: Режим активного мониторинга запущен.")
+    await send_telegram("🚀 Predator v2.0: Bayesian Engine + Synoptic Monitor активны.")
 
     cycle = 0
-    trailing_manager: Optional[TrailingStopManager] = None
     position_timer = PositionTimer()
-    
-    last_api_news_time = None
-    cached_api_news = ""
+    MAX_LOTS_ALLOWED = 8 
 
-    news_context: Dict[str, Any] = {"bias": None, "summary": ""}
-    current_bias: str = "neutral"
-
-    # Восстановление позиции при старте
-    try:
-        pos_start = await executor.get_position_data(FIGI_NRZ5)
-        if pos_start is None:
-            print("⏱️ PositionTimer: не удалось получить позицию при старте (сеть)")
-        else:
-            lots_start = pos_start["lots"]
-            avg_price_start = pos_start["average_price"]
-            if lots_start != 0 and avg_price_start != 0:
-                entry_time = load_last_entry_time_from_history(FIGI_NRZ5)
-                if entry_time is not None:
-                    position_timer.set_entry_time(entry_time)
-                    print(f"⏱️ PositionTimer восстановлен: {entry_time.isoformat()}")
-                else:
-                    position_timer.start()
-                    print(f"⏱️ PositionTimer запущен (позиция восстановлена)")
-    except Exception as e:
-        print(f"⚠️ Ошибка восстановления таймера: {e}")
-
-    # Новости при старте
-    startup_news = get_fundamental_news()
-    if startup_news:
-        print(f"📰 Новости: {len(startup_news)} символов")
-        rules_startup = parse_trading_rules_from_news()
-        initial_bias = rules_startup["bias"]
-        news_context = {"bias": initial_bias, "summary": startup_news[:200] if startup_news else ""}
-        print(f"🧠 Начальный BIAS: {initial_bias.upper()}")
-    else:
-        print("📰 Новости: файл пуст")
-
-    # Главный цикл
     while True:
-        now_msk = dt.datetime.now(pytz.timezone('Europe/Moscow'))
-        is_open, status_msg = get_market_status()
-
-        if not is_open:
-            # Используем глобальную переменную для контроля логов сна
-            global last_sleep_log_time
-            now_utc = dt.datetime.now(dt.timezone.utc)
-            
-            if last_sleep_log_time is None or (now_utc - last_sleep_log_time).total_seconds() >= 3 * 3600:
-                print(f"😴 {status_msg}. Бот в режиме ожидания.")
-                last_sleep_log_time = now_utc
-                
-            await asyncio.sleep(60) # <--- ТЕПЕРЬ ПРАВИЛЬНО
-            continue
-
-        # Рынок открыт
-        print(f"✅ {status_msg} | Цикл начинается...")
         try:
+            now_msk = dt.datetime.now(pytz.timezone('Europe/Moscow'))
+            is_open, status_msg = get_market_status()
+
+            if not is_open:
+                await asyncio.sleep(60)
+                continue
+
             cycle += 1
-            print(f"\n⏳ --- {cycle:06d} ---")
+            print(f"\n⏳ --- CYCLE {cycle:06d} | {now_msk.strftime('%H:%M:%S')} ---")
 
-            pnl_pct = 0.0
+            # 1. Получение данных о позиции
+            pos = await get_position_data_safe(executor, FIGI_NRF6, retries=3)
+            current_lots = int(pos["lots"])
+            avg_price = float(pos["average_price"])
 
-            # 1. Позиция
-            pos = await get_position_data_safe(executor, FIGI_NRZ5, retries=3)
-            lots = pos["lots"]
-            avg_price = pos["average_price"]
-            if lots != 0:
-                print(f"💼 Позиция: {lots} шт. @ {avg_price:.3f}")
-
-            # 2. Свечи и индикаторы
-            print("⚙️ Анализ...")
-            candles = await executor.get_candles(FIGI_NRZ5)
+            # 2. Получение и анализ свечей
+            candles = await executor.get_candles(FIGI_NRF6)
             if candles.empty:
-                print("⚠️ Нет свечей, ждем...")
+                print("⚠️ Свечи не получены, ожидание 10с...")
                 await asyncio.sleep(10)
                 continue
 
-            data = pipeline_analysis(candles, "NRZ5")
-            price = float(data["close"])
-            atr = float(data.get("ATR", 0.0))
-            print(f"✅ Цена: {price:.3f} | RSI: {data['RSI']:.1f}")
-
-            # 2a. Свечи 5m для тренда (упрощенно)
-            candles_5m = await executor.get_candles_5m(FIGI_NRZ5)
+            data = pipeline_analysis(candles, "NRF6")
+            current_price = float(data["close"])
+            rsi_val = float(data.get("RSI", 50.0))
             
-            momentum_24h = 0.0
+            # 3. Синоптический мониторинг (v2.0)
+            print("🌡️ Опрос метеослужб (Open-Meteo)...")
+            weather_data = await weather_monitor.get_weather_impact()
+            weather_str = weather_monitor.get_weather_context_str(weather_data)
+            print(f"📡 {weather_str}")
+
+            # 4. Фундаментал и новости (Прямое чтение news.txt)
             try:
-                if len(candles_5m) >= 288:
-                    current_price_5m = float(candles_5m["close"].iloc[-1])
-                    price_24h_ago_5m = float(candles_5m["close"].iloc[-288])
-                    momentum_24h = (current_price_5m / price_24h_ago_5m - 1.0) * 100.0
-                    print(f"📊 Momentum 24h: {momentum_24h:+.2f}%")
+                with open("news.txt", "r", encoding="utf-8") as f:
+                    manual_news = f.read().strip()
             except Exception as e:
-                print(f"⚠️ Ошибка momentum: {e}")
-                momentum_24h = 0.0
+                print(f"⚠️ Ошибка чтения news.txt: {e}")
+                manual_news = ""
 
-            if candles_5m.empty or len(candles_5m) < 200:
-                trend_5m = "FLAT"
-            else:
-                candles_5m["SMA50"] = candles_5m["close"].rolling(window=50).mean()
-                candles_5m["SMA200"] = candles_5m["close"].rolling(window=200).mean()
-                last_row_5m = candles_5m.iloc[-1]
-                sma50_5m = float(last_row_5m["SMA50"])
-                sma200_5m = float(last_row_5m["SMA200"])
+            rules = parse_trading_rules_from_news() # Эта функция у тебя есть и она работает
 
-                if price > sma50_5m and sma50_5m > sma200_5m:
-                    base_trend = "UPTREND"
-                elif price < sma50_5m and sma50_5m < sma200_5m:
-                    base_trend = "DOWNTREND"
-                else:
-                    base_trend = "FLAT"
+            
+            # Интегрируем флаг экстрима для decide_action
+            if weather_data.get("is_extreme"):
+                rules["weather_alert"] = "EXTREME"
 
-                if base_trend == "FLAT":
-                    if momentum_24h > 5:
-                        trend_5m = "UPTREND"
-                    elif momentum_24h < -5:
-                        trend_5m = "DOWNTREND"
-                    else:
-                        trend_5m = "FLAT"
-                else:
-                    trend_5m = base_trend
+            current_bias = rules.get("bias", "neutral")
 
-            print(f"📊 Тренд 5m: {trend_5m}")
+            # 5. AI АНАЛИЗ (Bayesian Engine)
+            # Передаем комбинированный контекст: Погода + Новости
+            full_context = f"{weather_str}\nНОВОСТИ:\n{manual_news}"
+            
+            print(f"🧠 Bayesian Engine: Анализ... (Bias: {current_bias})")
+            ai_result = await analyst.analyze(
+                market_data=data,
+                news_context=full_context,
+                bias=current_bias
+            )
 
-            # 3. PnL
-            if lots != 0 and avg_price > 0:
-                diff = price - avg_price
-                pnl = diff if lots > 0 else -diff
-                pnl_pct = pnl / avg_price * 100
-                print(f"📈 PnL: {pnl:.3f} ({pnl_pct:.2f}%)")
+            print(f"🤖 AI: {ai_result.signal} | Conf: {ai_result.confidence}%")
+            print(f"📈 Prob: Bullish {ai_result.bullish_prob*100:.0f}% | Bearish {ai_result.bearish_prob*100:.0f}%")
 
-            # 4. SL/TP
-            stop_price = None
-            if lots > 0 and avg_price > 0 and atr > 0:
-                stop_price_raw = avg_price - 2.0 * atr
-                stop_price_min = avg_price * 0.95
-                stop_price = min(stop_price_raw, stop_price_min)
+            # 6. ПРИНЯТИЕ РЕШЕНИЯ
+            # Для тренда используем данные из пайплайна или 5m свечей
+            trend_5m = data.get("trend", "FLAT")
 
-            # 5. Дневное изменение и Экспирация
-            daily_change = calc_daily_change(candles)
-            exp_date = await executor.get_future_expiration(FIGI_NRZ5)
-            days_to_expiration = (exp_date - dt.datetime.now(dt.timezone.utc)).total_seconds() / 86400.0 if exp_date else 999.0
+            action, action_reason = decide_action(
+                lots=current_lots,
+                max_lots=MAX_LOTS_ALLOWED,
+                ai_signal=ai_result.signal,
+                ai_confidence=ai_result.confidence,
+                bullish_prob=ai_result.bullish_prob,
+                bearish_prob=ai_result.bearish_prob,
+                trend_5m=trend_5m,
+                rsi=rsi_val,
+                bias=current_bias,
+                rules=rules
+            )
 
-            # 5.3. Метрики времени
-            minutes_to_clearing = get_minutes_to_clearing()
-            holding_hours = position_timer.get_holding_hours()
+            # 7. ИСПОЛНЕНИЕ ОРДЕРОВ
+            if action != "NOOP":
+                print(f"➡️ ACTION: {action} | Reason: {action_reason}")
+                
+                if action == "BUY1":
+                    await post_order_guarded(executor, FIGI_NRF6, "BUY", 1, why=action_reason)
+                elif action == "SELL1":
+                    await post_order_guarded(executor, FIGI_NRF6, "SELL", 1, why=action_reason)
+                elif action == "SELL_ALL" and current_lots > 0:
+                    await post_order_guarded(executor, FIGI_NRF6, "SELL", abs(current_lots), why=action_reason)
+                elif action == "BUY_ALL" and current_lots < 0:
+                    await post_order_guarded(executor, FIGI_NRF6, "BUY", abs(current_lots), why=action_reason)
+                elif action == "SELL_HALF" and current_lots > 0:
+                    qty = max(1, current_lots // 2)
+                    await post_order_guarded(executor, FIGI_NRF6, "SELL", qty, why=action_reason)
+                elif action == "BUY_HALF" and current_lots < 0:
+                    qty = max(1, abs(current_lots) // 2)
+                    await post_order_guarded(executor, FIGI_NRF6, "BUY", qty, why=action_reason)
 
-            # 5.4. Ранние выходы (SELL_ALL, SELL_HALF)
-            early_exit_action: Optional[str] = None
-            early_exit_reason: str = ""
+            # 8. ЛОГИРОВАНИЕ
+           # log_decision_block(
+                cycle=cycle, price=current_price, rsi=rsi_val,
+                trend=trend_5m, lots=current_lots,
+                holdinghours=position_timer.get_holding_hours(),
+                aisignal=ai_result.signal, aiconfidence=ai_result.confidence,
+                bias=current_bias, minutestoclearing=get_minutes_to_clearing(),
+                rules=rules, action=action, reason=action_reason
+           # )
 
-            if check_stale_position(lots, pnl_pct, holding_hours):
-                early_exit_action = "SELL_ALL"
-                early_exit_reason = "STALE_POSITION"
-
-            elif minutes_to_clearing <= 60:
-                clearing_action = check_clearing_profit_take(
-                    lots, pnl_pct, minutes_to_clearing, trend_5m, "HOLD", 0
-                )
-                if clearing_action:
-                    early_exit_action = clearing_action
-                    early_exit_reason = "CLEARING_TP"
-
-            elif check_intraday_profit_take(lots, pnl_pct, holding_hours, minutes_to_clearing):
-                early_exit_action = "SELL_HALF"
-                early_exit_reason = "INTRADAY_TP"
-
-            if early_exit_action and lots > 0:
-                if early_exit_action == "SELL_ALL":
-                    qty = lots
-                    ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"Early exit | {early_exit_reason}")
-                    if ok:
-                        await send_telegram(f"🎯 {early_exit_reason}: SELL {qty} @ {price:.3f}")
-                        trailing_manager = None
-                        position_timer.reset()
-                        lots = 0
-
-                elif early_exit_action == "SELL_HALF":
-                    qty = max(1, lots // 2)
-                    ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", qty, why=f"Early exit | {early_exit_reason}")
-                    if ok:
-                        await send_telegram(f"💰 {early_exit_reason}: SELL {qty} @ {price:.3f}")
-                        lots -= qty
-                        if trailing_manager:
-                            breakeven_price = trailing_manager.entry_price * 1.003
-                            if breakeven_price > trailing_manager.trailing_stop:
-                                trailing_manager.trailing_stop = breakeven_price
-
-                print(f"⏳ Цикл {cycle} завершен по {early_exit_reason}")
-
-            # Восстановление trailing stop
-            if lots != 0 and trailing_manager is None and avg_price > 0 and atr > 0:
-                if lots > 0:
-                    trailing_manager = TrailingStopManager(entry_price=avg_price, atr=atr, trend=trend_5m)
-                    print(f"✅ Трейлинг восстановлен: LONG @ {avg_price:.4f}")
-
-            print(f"DEBUG TRAILING: lots={lots}, tm={'EXISTS' if trailing_manager else 'NONE'}")
-
-            if not early_exit_action:
-                # 5.5. Trailing Stop Logic
-                trailing_stop_triggered = False
-
-                if lots != 0 and trailing_manager is not None:
-                    should_exit = trailing_manager.update(price, trend_5m)
-                    if should_exit:
-                        trailing_stop_triggered = True
-                        direction = "SELL" if lots > 0 else "BUY"
-                        qty = abs(lots)
-                        ok = await post_order_guarded(executor, FIGI_NRZ5, direction, qty, why="TRAILING_STOP")
-                        if ok:
-                            trailing_manager = None
-                            position_timer.reset()
-                            lots = 0
-                            print(f"⏳ Цикл {cycle} завершен по trailing-stop")
-
-                if not trailing_stop_triggered:
-                    # --- [ПОЛНОСТЬЮ АВТОНОМНЫЙ БЛОК: НОВОСТИ + AI] ---
-                    rules_current = {}
-                    current_news_context = "Нет данных"
-                    action_blocked_by_commission = False  # Гарантируем наличие
-
-                    # 1. Сбор новостей и BIAS
-                    try:
-                        manual_news = get_fundamental_news()
-                        now_utc = dt.datetime.now(dt.timezone.utc)
-                        if last_api_news_time is None or (now_utc - last_api_news_time).total_seconds() > 1200:
-                            cached_api_news = await news_agent.get_aggregated_sentiment_context()
-                            last_api_news_time = now_utc
-
-                        # Жесткая очистка от словарей (dict -> str)
-                        if isinstance(manual_news, dict):
-                            news_text = str(manual_news.get('summary', manual_news))
-                        else:
-                            news_text = str(manual_news)
-                        
-                        current_news_context = news_text if len(news_text) > 10 else str(cached_api_news)
-                        
-                        rules_current = parse_trading_rules_from_news()
-                        current_bias = str(rules_current.get("bias", "neutral"))
-                    except Exception as e:
-                        print(f"⚠️ Ошибка новостей: {e}")
-                        current_bias = "neutral"
-
-                    # Динамический BIAS
-                    if current_bias == "neutral":
-                        if momentum_24h > 8.0: current_bias = "bullish"
-                        elif momentum_24h < -8.0: current_bias = "bearish"
-                    print(f"🧭 BIAS: {current_bias.upper()}")
-
-                    # 2. Расчет блокировки по комиссии (возвращаем расчет внутрь)
-                    if lots > 0 and 0 < pnl_pct < MIN_PROFIT_PCT:
-                        if holding_hours < 0.5:
-                            action_blocked_by_commission = True
-                            print(f"⏸️ Комиссия: PnL {pnl_pct:.2f}% < {MIN_PROFIT_PCT}% → HOLD")
-
-                    # 3. AI АНАЛИЗ (ФИНАЛЬНОЕ РЕШЕНИЕ ОШИБКИ ТИПОВ)
-                    # Берем значения напрямую из data, чтобы не было NameError
-                    current_rsi = data.get('RSI', 50)
-                    
-                    market_str = (
-                        f"Ticker: NRZ5, Price: {price:.3f}, RSI: {current_rsi:.1f}, "
-                        f"Trend: {trend_5m}, Momentum: {momentum_24h:.2f}%"
-                    )
-
-                    print(f"🔄 AI запрос (текстовый режим)... BIAS: {current_bias}")
-                    try:
-                        ai_result = await asyncio.wait_for(
-                            analyst.analyze(
-                                market_data=market_str,  # Передаем строку
-                                news_context=str(current_news_context),
-                                bias=str(current_bias)
-                            ),
-                            timeout=30.0
-                        )
-                        signal, confidence, reason = ai_result.signal, ai_result.confidence, ai_result.reason
-                        print(f"🤖 AI Decision: {signal} ({confidence}%)")
-                    except Exception as e:
-                        print(f"❌ Ошибка в analyst.analyze: {e}")
-                        signal, confidence, reason = "HOLD", 0, f"AI Error: {e}"
-
-
-
-                    # 4. Решение и Лимиты
-                    max_lots_allowed, _ = get_max_lots_allowed()
-                    action = decide_action(
-                        lots=lots, max_lots_allowed=max_lots_allowed,
-                        ai_signal=signal, ai_confidence=confidence,
-                        trend_5m=trend_5m, rsi=data.get('RSI', 50),
-                        bias=current_bias, rules=rules_current
-                    )
-
-                    # 5. Блокировки и Риски
-                    action_reason = ""
-                    if action == "BUY_1" and lots >= max_lots_allowed:
-                        action, action_reason = "NOOP", f"Лимит {max_lots_allowed} лотов"
-                    elif action_blocked_by_commission and action in ("SELL_ALL", "SELL_HALF"):
-                        action, action_reason = "NOOP", "Блокировка комиссией"
-
-                    # 6. Экстренный выход
-                    if lots > 0 and avg_price > 0 and atr > 0:
-                        if (avg_price - price) >= 2.0 * atr or (stop_price and price <= stop_price):
-                            print("🚨 EMERGENCY EXIT!")
-                            ok = await post_order_guarded(executor, FIGI_NRZ5, "SELL", abs(lots), why="Risk Exit")
-                            if ok:
-                                action, action_reason = "SELL_ALL", "RISK_EXIT_EXECUTED"
-                                trailing_manager, lots = None, 0
-                                position_timer.reset()
-
-                    # 7. ФИНАЛЬНОЕ ЛОГИРОВАНИЕ
-                    log_decision_block(
-                        cycle=cycle, price=price, rsi=data.get('RSI', 50),
-                        trend=trend_5m, lots=lots, pnl_pct=pnl_pct,
-                        holding_hours=holding_hours, ai_signal=signal,
-                        ai_confidence=confidence, bias=current_bias,
-                        minutes_to_clearing=minutes_to_clearing,
-                        rules=rules_current, action=action,
-                        reason=action_reason if action_reason else reason
-                    )
-
-
-
-            # Пауза 60 секунд после завершения цикла
-            print(f"⏳ Итерация {cycle} завершена. Спим 60 секунд...")
             await asyncio.sleep(60)
 
         except Exception as e:
-            print(f"❌ Critical error in main_loop: {e}")
+            print(f"💥 Critical Error in main_loop: {e}")
             import traceback
             traceback.print_exc()
             await asyncio.sleep(10)
+
+
 
 if __name__ == "__main__":
     asyncio.run(main_loop())

@@ -1,54 +1,43 @@
-import os
-from pathlib import Path
-
+from typing import Optional, Dict, Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import SecretStr, Field
-
-
-BASE_DIR = Path(__file__).parent.parent.parent
-
+from pydantic import SecretStr
 
 class Settings(BaseSettings):
-    # --- Основные настройки ---
-    APP_NAME: str = "Predator.FinAgent.v1"
-    SANDBOX_MODE: bool = False
-    DEV_MODE: bool = True  # <--- Включаем режим разработки
-
-    # --- Tinkoff ---
-    TINKOFF_TOKEN: SecretStr = Field(validation_alias="TINKOFF_TOKEN")
-
-    # --- AI (OpenRouter) ---
-    OPENROUTER_API_KEY: SecretStr = Field(
-        validation_alias="OPENROUTER_API_KEY"
-    )
+    # API Keys & URLs
+    TINKOFF_TOKEN: SecretStr
+    OPENROUTER_API_KEY: SecretStr
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+    TELEGRAM_BOT_TOKEN: SecretStr
+    TELEGRAM_CHAT_ID: str
+    EIA_API_KEY: Optional[SecretStr] = None
 
-    AI_MODEL_ANALYST: str = "nex-agi/deepseek-v3.1-nex-n1:free"
-    AI_MODEL_PLANNER: str = "openai/gpt-oss-20b:free"
-    AI_MODEL_RISK: str = "xiaomi/mimo-v2-flash:free"
+    # AI Model Configuration (Три модели с указанным nex-agi)
+    AI_MODEL_ANALYST: str = "google/gemini-3-flash-preview"
+    AI_MODEL_PLANNER: str = "google/gemini-3-flash-preview"
+    AI_MODEL_RISK: str = "google/gemini-3-flash-preview"
 
-    # --- Telegram ---
-    TELEGRAM_BOT_TOKEN: SecretStr = Field(
-        validation_alias="TELEGRAM_BOT_TOKEN"
-    )
-    TELEGRAM_CHAT_ID: int = Field(validation_alias="TELEGRAM_CHAT_ID")
+    # Trading Parameters (v2.0 Hybrid Architecture)
+    MAX_LOTS: int = 8
+    
+    # Bayesian Thresholds
+    CONFIDENCE_THRESHOLD_DEFAULT: int = 70
+    CONFIDENCE_THRESHOLD_EXTREME: int = 40
+    
+    # Bayesian Probability Thresholds
+    PROB_HEDGE_TRIGGER: float = 0.30
+    PROB_REBALANCE_TRIGGER: float = 0.65
+    
+    # Synoptic Monitor (Henry Hub Coordinates)
+    WEATHER_LAT: float = 29.95
+    WEATHER_LON: float = -90.07
 
-    # --- EIA (Natural Gas Storage) ---
-    EIA_API_KEY: str = Field(validation_alias="EIA_API_KEY")
-
+    # App Settings
+    LOG_LEVEL: str = "INFO"
+    
     model_config = SettingsConfigDict(
-        env_file=os.path.join(BASE_DIR, ".env"),
+        env_file=".env", 
         env_file_encoding="utf-8",
-        extra="ignore",
+        extra="ignore"
     )
 
-
-try:
-    settings = Settings()
-except Exception as e:
-    print(f"❌ Ошибка загрузки конфига: {e}")
-    import pydantic
-
-    if isinstance(e, pydantic.ValidationError):
-        print(f"🔍 Детали: {e.errors()}")
-    raise e
+settings = Settings()
