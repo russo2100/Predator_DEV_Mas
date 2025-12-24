@@ -5,3 +5,8 @@ __pycache__/
 logs/
 shadowagentslog.jsonl
 tradehistory.csv
+.env
+memory/
+logs/
+__pycache__/
+*.pyc
