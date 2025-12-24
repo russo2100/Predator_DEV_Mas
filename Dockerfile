@@ -1,20 +1,19 @@
-# Используем Python 3.13 (JIT совместимость)
-FROM python:3.13-slim
+FROM python:3.11.9-slim
 
-# Устанавливаем системные зависимости для сборки некоторых пакетов
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Рабочая директория
-WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Копируем зависимости
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY . /app
 
-# Копируем проект
-COPY . .
+ENV PYTHONPATH=/app
 
-# Команда запуска (используем main.py)
-CMD ["python", "src/main.py"]
+CMD ["python", "-m", "src.main"]
