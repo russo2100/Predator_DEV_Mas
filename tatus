@@ -1,0 +1,69 @@
+[1mdiff --cc .gitignore[m
+[1mindex c4f513e,56d95ca..0000000[m
+[1m--- a/.gitignore[m
+[1m+++ b/.gitignore[m
+[36m@@@ -1,24 -1,40 +1,60 @@@[m
+[31m- .venv/[m
+  .env[m
+[31m- *.pyc[m
+[32m+ .env.*[m
+  __pycache__/[m
+[31m- logs/[m
+[31m- shadowagentslog.jsonl[m
+[32m+ *.py[cod][m
+[32m+ .venv/[m
+[32m+ venv/[m
+[32m+ .vscode/[m
+[32m+ .idea/[m
+[32m+ *.log[m
+[32m+ *.jsonl[m
+  tradehistory.csv[m
+[32m++<<<<<<< HEAD[m
+[32m +.env[m
+[32m +memory/[m
+[32m +logs/[m
+[32m +__pycache__/[m
+[32m +*.pyc[m
+[32m +[m
+[32m +invest-python/[m
+[32m +[m
+[32m +[m
+[32m +invest-python/[m
+[32m +[m
+[32m +[m
+[32m +invest-python/[m
+[32m +[m
+[32m +[m
+[32m +invest-python/[m
+[32m +[m
+[32m++=======[m
+[32m+ shadowagentslog.jsonl[m
+[32m+ news.txt[m
+[32m+ *.db[m
+[32m+ .cache/[m
+[32m+ [m
+[32m+ # Secrets / local runtime[m
+[32m+ src/config/settings.py[m
+[32m+ settings.py[m
+[32m+ *.env[m
+[32m+ news.txt[m
+[32m+ shadow_agents_log.jsonl[m
+[32m+ shadowagentslog.jsonl[m
+[32m+ trade_history.csv[m
+[32m+ tradehistory.csv[m
+[32m+ state.json[m
+[32m+ *.broken.*[m
+[32m+ [m
+[32m+ # Runtime / logs (do not commit)[m
+[32m+ .env[m
+[32m+ .env.*[m
+[32m+ news.txt[m
+[32m+ shadow_agents_log.jsonl[m
+[32m+ shadowagentslog.jsonl[m
+[32m+ trade_history.csv[m
+[32m+ tradehistory.csv[m
+[32m+ state.json[m
+[32m+ src/*.broken.*[m
+[32m+ src/**/*.broken.*[m
+[32m+ news.txt[m
+[32m++>>>>>>> 3afa8e6 (chore: cron news refresh + ignore news.txt)[m
