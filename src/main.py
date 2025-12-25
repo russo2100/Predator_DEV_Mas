@@ -1262,6 +1262,7 @@ async def main_loop():
     analyst = MarketAnalyst()
     planner = PlannerAgent()
     risk_agent = RiskAgent()
+    storage_agent = StorageAgent(api_key=settings.EIA_API_KEY.get_secret_value())
     executor = OrderExecutor(token)
     news_agent = UnifiedNewsAgent()
     shadow_adapter = MultiAgentShadowAdapter()
@@ -1334,6 +1335,17 @@ async def main_loop():
 
             # 6. RISK_AGENT оценивает рыночный риск
             print("🛡️ RISK_AGENT: Оценка волатильности и входа...")
+
+            # ---- STORAGE AGENT ----
+            print("📦 STORAGE_AGENT: Анализ запасов EIA...")
+            try:
+                storage_data = await storage_agent.get_storage_data()
+                if storage_data and storage_data.get("success"):
+                    storage_context = storage_agent.get_storage_context_str(storage_data)
+                    print(f"📦 {storage_context}")
+                    manual_news += f" | {storage_context}"
+            except Exception as e:
+                print(f"⚠️ Storage: {e}")
             risk_verdict = risk_agent.assess_risk(
                 alpha_signal={
                     "signal": news_result.signal,
