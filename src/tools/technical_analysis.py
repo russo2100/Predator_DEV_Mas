@@ -83,3 +83,111 @@ class TechnicalAnalysis:
 
         df.dropna(inplace=True)
         return df
+
+    @staticmethod
+    def detect_structure(df: pd.DataFrame) -> dict:
+        """
+        Определяет структуру рынка: IMPULSE_UP, IMPULSE_DOWN, CORRECTION, RANGE
+        
+        Returns:
+            dict: {
+                'market_state': str,
+                'range_width_atr': float,
+                'impulse_strength': float,
+                'confidence': float
+            }
+        """
+        if df.empty or len(df) < 20:
+            return {
+                'market_state': 'RANGE',
+                'range_width_atr': 0.0,
+                'impulse_strength': 0.0,
+                'confidence': 0.5
+            }
+        
+        try:
+            # Получаем последние данные
+            last = df.iloc[-1]
+            last_20 = df.tail(20)
+            
+            close = last['close']
+            atr = last.get('ATR', 0.10)
+            bb_width = last.get('BB_Width', 0.02)
+            kalman_signal = last.get('Kalman_Signal', 0)
+            
+            # Вычисляем силу движения за последние 20 свечей
+            price_change = (close - last_20['close'].iloc[0]) / last_20['close'].iloc[0] * 100
+            price_change_atr = abs(close - last_20['close'].iloc[0]) / atr if atr > 0 else 0
+            
+            # Волатильность (нормализованная)
+            volatility = bb_width
+            
+            # --- ЛОГИКА КЛАССИФИКАЦИИ ---
+            
+            # 1. RANGE: узкий диапазон, низкая волатильность
+            if bb_width < 0.02 and price_change_atr < 1.5:
+                return {
+                    'market_state': 'RANGE',
+                    'range_width_atr': price_change_atr,
+                    'impulse_strength': abs(price_change),
+                    'confidence': 0.85
+                }
+            
+            # 2. IMPULSE_UP: сильное движение вверх + Kalman подтверждает
+            if price_change > 1.0 and price_change_atr > 2.0 and kalman_signal > 0:
+                return {
+                    'market_state': 'IMPULSE_UP',
+                    'range_width_atr': price_change_atr,
+                    'impulse_strength': price_change,
+                    'confidence': 0.90
+                }
+            
+            # 3. IMPULSE_DOWN: сильное движение вниз + Kalman подтверждает
+            if price_change < -1.0 and price_change_atr > 2.0 and kalman_signal < 0:
+                return {
+                    'market_state': 'IMPULSE_DOWN',
+                    'range_width_atr': price_change_atr,
+                    'impulse_strength': abs(price_change),
+                    'confidence': 0.90
+                }
+            
+            # 4. CORRECTION: откат после тренда
+            # Проверяем, был ли недавно импульс (последние 40 свечей)
+            last_40 = df.tail(40) if len(df) >= 40 else df
+            max_price = last_40['close'].max()
+            min_price = last_40['close'].min()
+            
+            # Откат после роста
+            if close < max_price * 0.98 and kalman_signal > 0 and price_change < 0:
+                return {
+                    'market_state': 'CORRECTION',
+                    'range_width_atr': price_change_atr,
+                    'impulse_strength': abs(price_change),
+                    'confidence': 0.75
+                }
+            
+            # Откат после падения
+            if close > min_price * 1.02 and kalman_signal < 0 and price_change > 0:
+                return {
+                    'market_state': 'CORRECTION',
+                    'range_width_atr': price_change_atr,
+                    'impulse_strength': abs(price_change),
+                    'confidence': 0.75
+                }
+            
+            # 5. По умолчанию: RANGE (если не уверены)
+            return {
+                'market_state': 'RANGE',
+                'range_width_atr': price_change_atr,
+                'impulse_strength': abs(price_change),
+                'confidence': 0.60
+            }
+            
+        except Exception as e:
+            print(f"⚠️ Ошибка detect_structure: {e}")
+            return {
+                'market_state': 'RANGE',
+                'range_width_atr': 0.0,
+                'impulse_strength': 0.0,
+                'confidence': 0.5
+            }
