@@ -38,3 +38,4 @@ src/**/*.broken.*
 memory/
 invest-python/
 src/config/settings.py
+_dump_from_container_*
