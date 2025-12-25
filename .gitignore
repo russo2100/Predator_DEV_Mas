@@ -37,3 +37,4 @@ src/**/*.broken.*
 # Project-specific extras (safe to ignore)
 memory/
 invest-python/
+src/config/settings.py
