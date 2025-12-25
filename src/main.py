@@ -12,12 +12,13 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from src.config.settings import settings
 from src.core.pipeline import pipeline_analysis
-from tinkoff.invest import AsyncClient, OrderDirection, OrderType, CandleInterval, Future
+from t_tech.invest import AsyncClient, OrderDirection, OrderType, CandleInterval, Future
 from pathlib import Path
 import os
 import time
 from src.core.multi_agent_adapter import MultiAgentShadowAdapter 
 from src.agents.planner import PlannerAgent
+from src.agents.risk_agent import RiskAgent
 from src.tools.news_aggregator import UnifiedNewsAgent
 import datetime as dt
 import pytz
@@ -1026,16 +1027,29 @@ async def log_trade(
         print(f"⚠️ Ошибка логирования сделки: {e}")
 
 
-def log_decision_block(cycle: int, price: float, rsi: float, trend: str, lots: int, pnl_pct: float, 
-                       holding_hours: float, ai_signal: str, ai_confidence: float, bias: str, 
-                       minutes_to_clearing: int, rules: dict, action: str, reason: str):
+def log_decision_block(
+    cycle: int, 
+    price: float, 
+    rsi: float, 
+    trend: str, 
+    lots: int,
+    holding_hours: float, 
+    ai_signal: str, 
+    ai_confidence: float, 
+    bias: str,
+    minutes_to_clearing: int, 
+    rules: dict, 
+    action: str, 
+    reason: str,
+    pnl_pct: float = 0.0  # ← Сделал опциональным с дефолтом 0.0
+):
     """
     Выводит блок принятия решения в консоль и записывает его в shadow_agents_log.jsonl.
     """
     import json
-    import os
     from datetime import datetime
     import pytz
+    from pathlib import Path
 
     # 1. Визуальный вывод в консоль
     print("\n" + "="*70)
@@ -1044,20 +1058,20 @@ def log_decision_block(cycle: int, price: float, rsi: float, trend: str, lots: i
     print(f"💰 Price: {price:.3f} | RSI: {rsi:.1f} | Trend: {trend}")
     print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
     print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
-    
+
     if rules.get('max_buy_price'):
         print(f"🟢 MAX_BUY: {rules['max_buy_price']:.3f}")
     if rules.get('min_sell_price'):
         print(f"🔴 MIN_SELL: {rules['min_sell_price']:.3f}")
 
-    emoji_map = {"BUY": "🚀", "SELL_ALL": "💥", "SELL_HALF": "⚖️", "NOOP": "😴"}
+    emoji_map = {"BUY": "🚀", "SELL_ALL": "💥", "SELL_HALF": "⚖️", "NOOP": "😴", "BUY1": "🎯", "SELL1": "🎯", "BUY_ALL": "💪", "BUY_HALF": "⚡"}
     emoji = emoji_map.get(action, "🔍")
     print(f"➡️ ACTION: {emoji} {action}")
     if reason:
         print(f"📝 Reason: {reason}")
     print("="*70 + "\n")
 
-    # 2. Формируем расширенный лог (похожий на ваш старый формат)
+    # 2. Формируем лог-запись
     log_entry = {
         "timestamp": datetime.now(pytz.timezone("Europe/Moscow")).isoformat(),
         "cycle": cycle,
@@ -1068,6 +1082,7 @@ def log_decision_block(cycle: int, price: float, rsi: float, trend: str, lots: i
             "lots": lots,
             "pnl_pct": pnl_pct,
             "holding_hours": holding_hours,
+            "minutes_to_clearing": minutes_to_clearing,
             "bias": bias
         },
         "decision": {
@@ -1078,6 +1093,26 @@ def log_decision_block(cycle: int, price: float, rsi: float, trend: str, lots: i
             "rules": rules
         }
     }
+
+    # 3. Запись в файл shadow_agents_log.jsonl (БЕЗОПАСНАЯ)
+    try:
+        log_file = Path("shadow_agents_log.jsonl")
+        
+        # Гарантируем, что файл существует
+        log_file.touch(exist_ok=True)
+        
+        # Записываем строку в конец файла
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+            f.flush()  # Явное сброс буфера на диск
+        
+    except PermissionError as e:
+        print(f"⚠️ WARN: No write permission to shadow_agents_log.jsonl: {e}")
+    except OSError as e:
+        print(f"⚠️ WARN: OS error writing log: {e}")
+    except Exception as e:
+        print(f"⚠️ WARN: Unexpected error in logging: {type(e).__name__}: {e}")
+
 
     # 3. Запись в файл shadow_agents_log.jsonl
     try:
@@ -1220,6 +1255,7 @@ async def main_loop():
     
     analyst = MarketAnalyst()
     planner = PlannerAgent()
+    risk_agent = RiskAgent()
     executor = OrderExecutor(token)
     news_agent = UnifiedNewsAgent()
     shadow_adapter = MultiAgentShadowAdapter()
@@ -1260,14 +1296,15 @@ async def main_loop():
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
             rsi_val = float(data.get("RSI", 50.0))
-            
-            # 3. Синоптический мониторинг (v2.0)
+            trend_5m = data.get("trend", "FLAT")
+
+            # 3. Синоптический мониторинг (погода)
             print("🌡️ Опрос метеослужб (Open-Meteo)...")
             weather_data = await weather_monitor.get_weather_impact()
             weather_str = weather_monitor.get_weather_context_str(weather_data)
             print(f"📡 {weather_str}")
 
-            # 4. Фундаментал и новости (Прямое чтение news.txt)
+            # 4. Фундаментал и новости (news.txt)
             try:
                 with open("news.txt", "r", encoding="utf-8") as f:
                     manual_news = f.read().strip()
@@ -1275,76 +1312,101 @@ async def main_loop():
                 print(f"⚠️ Ошибка чтения news.txt: {e}")
                 manual_news = ""
 
-            rules = parse_trading_rules_from_news() # Эта функция у тебя есть и она работает
-
-            
-            # Интегрируем флаг экстрима для decide_action
-            if weather_data.get("is_extreme"):
-                rules["weather_alert"] = "EXTREME"
-
+            rules = parse_trading_rules_from_news()
             current_bias = rules.get("bias", "neutral")
 
-            # 5. AI АНАЛИЗ (Bayesian Engine)
-            # Передаем комбинированный контекст: Погода + Новости
+            # 5. NEWS_AGENT анализирует новости + техничку
+            print("📰 NEWS_AGENT: Анализ новостей и фундамента...")
             full_context = f"{weather_str}\nНОВОСТИ:\n{manual_news}"
-            
-            print(f"🧠 Bayesian Engine: Анализ... (Bias: {current_bias})")
-            ai_result = await analyst.analyze(
-                market_data=data,
-                news_context=full_context,
+            news_result = await analyst.analyze(
+                marketdata=data,
+                newscontext=full_context,
                 bias=current_bias
             )
+            print(f"🤖 AI: {news_result.signal} | Conf: {news_result.confidence}%")
+            print(f"📈 Prob: Bullish {news_result.bullish_prob*100:.0f}% | Bearish {news_result.bearish_prob*100:.0f}%")
 
-            print(f"🤖 AI: {ai_result.signal} | Conf: {ai_result.confidence}%")
-            print(f"📈 Prob: Bullish {ai_result.bullish_prob*100:.0f}% | Bearish {ai_result.bearish_prob*100:.0f}%")
+            # 6. RISK_AGENT оценивает рыночный риск
+            print("🛡️ RISK_AGENT: Оценка волатильности и входа...")
+            risk_verdict = risk_agent.assess_risk(
+                alpha_signal={
+                    "signal": news_result.signal,
+                    "confidence": news_result.confidence,
+                    "reason": ""
+                },
+                market_data={
+                    "ATR": data.get("ATR", 0.1),
+                    "RSI": rsi_val,
+                    "ATRSL": data.get("ATRSL", 0.05),
+                    "ATRTP": data.get("ATRTP", 0.15)
+                }
+            )
+            risk_allowed = risk_verdict["allowed"]
+            print(f"✓ Risk Verdict: {risk_verdict['reason']} | Risk Score: {risk_verdict['risk_score']}")
 
-            # 6. ПРИНЯТИЕ РЕШЕНИЯ
-            # Для тренда используем данные из пайплайна или 5m свечей
-            trend_5m = data.get("trend", "FLAT")
+            # 7. PLANNER синтезирует стратегию
+            print("🧠 PLANNER: Синтез торговой стратегии...")
+            market_context = {
+                "ticker": "NG",
+                "trend_d1": trend_5m,
+                "trend_h1": trend_5m,
+                "news_summary": manual_news[:500]
+            }
+            plan_result = planner.create_plan(market_context)
+            print(f"🧩 plan_result keys: {list(plan_result.keys())} | plan_result={plan_result}")
+            final_bias = plan_result["bias"]
+            final_riskmode = plan_result.get("risk_mode") or plan_result.get("risk_mode") or plan_result.get("riskMode") or "CONSERVATIVE"
+            print(f"📋 Plan: Bias={final_bias}, RiskMode={final_riskmode}")
 
+            # 8. Интеграция погоды
+            if weather_data.get("is_extreme"):
+                print("⚠️ WEATHER_ALERT: Экстремальные условия!")
+                final_riskmode = "CONSERVATIVE"
+                risk_allowed = False  # Блокируем вход при экстремуме
+
+            # 9. DECISION_BLOCK: финальное решение
             action, action_reason = decide_action(
                 lots=current_lots,
                 max_lots=MAX_LOTS_ALLOWED,
-                ai_signal=ai_result.signal,
-                ai_confidence=ai_result.confidence,
-                bullish_prob=ai_result.bullish_prob,
-                bearish_prob=ai_result.bearish_prob,
+                ai_signal=news_result.signal,
+                ai_confidence=news_result.confidence,
+                bullish_prob=news_result.bullish_prob,
+                bearish_prob=news_result.bearish_prob,
                 trend_5m=trend_5m,
                 rsi=rsi_val,
-                bias=current_bias,
-                rules=rules
+                bias=final_bias,  # из PLANNER, а не из rules
+                rules=plan_result  # весь вывод PLANNER
             )
 
-            # 7. ИСПОЛНЕНИЕ ОРДЕРОВ
-            if action != "NOOP":
-                print(f"➡️ ACTION: {action} | Reason: {action_reason}")
-                
-                if action == "BUY1":
-                    await post_order_guarded(executor, FIGI_NRF6, "BUY", 1, why=action_reason)
-                elif action == "SELL1":
-                    await post_order_guarded(executor, FIGI_NRF6, "SELL", 1, why=action_reason)
-                elif action == "SELL_ALL" and current_lots > 0:
-                    await post_order_guarded(executor, FIGI_NRF6, "SELL", abs(current_lots), why=action_reason)
-                elif action == "BUY_ALL" and current_lots < 0:
-                    await post_order_guarded(executor, FIGI_NRF6, "BUY", abs(current_lots), why=action_reason)
-                elif action == "SELL_HALF" and current_lots > 0:
-                    qty = max(1, current_lots // 2)
-                    await post_order_guarded(executor, FIGI_NRF6, "SELL", qty, why=action_reason)
-                elif action == "BUY_HALF" and current_lots < 0:
-                    qty = max(1, abs(current_lots) // 2)
-                    await post_order_guarded(executor, FIGI_NRF6, "BUY", qty, why=action_reason)
+            # 10. Исполнение ордеров (фильтр по риску)
+            if risk_allowed and action != "NOOP":
+                direction = "BUY" if action.startswith("BUY") else "SELL"
+                qty = 1  # вычислить из action
+                print(f"➡️ EXECUTION: {action} | Risk Score: {risk_verdict['risk_score']}")
+                await post_order_guarded(executor, FIGI_NRF6, direction, qty, why=action_reason)
+            elif not risk_allowed and action != "NOOP":
+                print(f"🚫 BLOCKED by Risk: {risk_verdict['reason']}")
 
-            # 8. ЛОГИРОВАНИЕ
-           # log_decision_block(
-                cycle=cycle, price=current_price, rsi=rsi_val,
-                trend=trend_5m, lots=current_lots,
-                holdinghours=position_timer.get_holding_hours(),
-                aisignal=ai_result.signal, aiconfidence=ai_result.confidence,
-                bias=current_bias, minutestoclearing=get_minutes_to_clearing(),
-                rules=rules, action=action, reason=action_reason
-           # )
+            # 11. Логирование в shadow_agents_log.jsonl
+            log_decision_block(
+                cycle=cycle,
+                price=current_price,
+                rsi=rsi_val,
+                trend=trend_5m,
+                lots=current_lots,
+                holding_hours=position_timer.get_holding_hours(),
+                ai_signal=news_result.signal,
+                ai_confidence=news_result.confidence,
+                bias=final_bias,
+                minutes_to_clearing=get_minutes_to_clearing(),
+                rules=plan_result,
+                action=action,
+                reason=action_reason,
+            )
 
+            # 12. Ожидание 60 сек
             await asyncio.sleep(60)
+
 
         except Exception as e:
             print(f"💥 Critical Error in main_loop: {e}")

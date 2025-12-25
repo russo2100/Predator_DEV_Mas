@@ -1,24 +1,39 @@
-.venv/
+# Environment
 .env
-*.pyc
+.env.*
+*.env
+
+# Python
 __pycache__/
+*.py[cod]
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.iml
+
+# Logs & runtime artifacts (do not commit)
 logs/
+*.log
+*.jsonl
+shadow_agents_log.jsonl
 shadowagentslog.jsonl
 tradehistory.csv
-.env
+trade_history.csv
+state.json
+news.txt
+src/*.broken.*
+src/**/*.broken.*
+
+# Project-specific extras (safe to ignore)
 memory/
-logs/
-__pycache__/
-*.pyc
-
 invest-python/
-
-
-invest-python/
-
-
-invest-python/
-
-
-invest-python/
-

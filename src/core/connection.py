@@ -1,5 +1,5 @@
 import asyncio
-from tinkoff.invest import AsyncClient, Client
+from t_tech.invest import AsyncClient, Client
 from tinkoff.invest.services import Services
 from src.config.settings import settings
 

@@ -1,7 +1,7 @@
 import uuid
 import asyncio
 from typing import Dict, Union
-from tinkoff.invest import AsyncClient, OrderDirection, OrderType
+from t_tech.invest import AsyncClient, OrderDirection, OrderType
 from src.config.settings import settings
 
 

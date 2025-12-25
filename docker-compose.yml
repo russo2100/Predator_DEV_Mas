@@ -13,3 +13,4 @@ services:
       - ./memory:/app/memory
       - ./news.txt:/app/news.txt
       - ./logs:/app/logs
+      - ./shadow_agents_log.jsonl:/app/shadowagentslog.jsonl

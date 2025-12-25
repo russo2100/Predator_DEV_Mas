@@ -1,11 +1,15 @@
+# src/agents/analyst.py
+import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Any
+
 from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
+
 from src.config.settings import settings
 
-# Схема для гарантированного парсинга без ошибок
+
 class AnalysisResponse(BaseModel):
     signal: str = Field(description="Торговый сигнал: BUY, SELL или HOLD")
     confidence: int = Field(description="Уверенность в сигнале от 0 до 100")
@@ -13,65 +17,74 @@ class AnalysisResponse(BaseModel):
     bearish_prob: float = Field(description="Вероятность падения (0.0 - 1.0)")
     reason: str = Field(description="Подробное обоснование решения")
 
+
 class MarketAnalyst:
-    def __init__(self):
-        # Инициализация модели с поддержкой структурированного вывода
+    def __init__(self) -> None:
         self.llm = ChatOpenAI(
             model=settings.AI_MODEL_ANALYST,
             temperature=0.3,
             api_key=settings.OPENROUTER_API_KEY.get_secret_value(),
             base_url=settings.OPENROUTER_BASE_URL,
-        ).with_structured_output(AnalysisResponse)
-        
+            model_kwargs={"response_format": {"type": "json_object"}},
+            timeout=30,
+            max_retries=2,
+        )
         self.logger = logging.getLogger(__name__)
 
-    def _get_master_prompt(self, bias: str) -> ChatPromptTemplate:
-        """Формирование промпта с учетом текущего BIAS и метеоданных"""
-        bias_instr = {
-            "bullish": "ПРИОРpriority: LONG. Ищи точки входа в покупку. SHORT только при явном сломе тренда.",
-            "bearish": "ПРИОРpriority: SHORT. Ищи точки входа в продажу. LONG запрещен или только как хедж.",
-            "neutral": "Рынок нейтрален. Работай по техническим уровням и RSI."
-        }.get(bias.lower(), "Действуй по ситуации.")
+    def get_master_prompt(self, bias: str) -> ChatPromptTemplate:
+        bias_lower = (bias or "neutral").lower()
+
+        if bias_lower == "bullish":
+            bias_instr = "Приоритет LONG-сценариев; SHORT только при явных признаках разворота."
+        elif bias_lower == "bearish":
+            bias_instr = "Приоритет SHORT-сценариев; LONG только при явных признаках разворота."
+        else:
+            bias_instr = "Нейтральный режим: действуй по подтверждению RSI/тренда/волатильности."
+
+        bias_upper = (bias or "neutral").upper()
 
         system_msg = (
-            "Ты — ведущий аналитик рынка природного газа (NG). Твоя цель — Hybrid Architecture v2.0.\n"
-            "Вместо однозначного выбора ты должен оценивать ВЕРОЯТНОСТИ сценариев.\n"
-            f"Текущий фундаментальный BIAS: {bias.upper()}.\n"
-            f"Инструкция: {bias_instr}\n\n"
-            "АНАЛИЗИРУЙ:\n"
-            "1. Техническую картину (RSI, Trend, Momentum).\n"
-            "2. Фундаментальный контекст (погода, HDD, запасы).\n"
-            "3. Вероятность изменения тренда (Bayesian thinking).\n\n"
-            "Выдай ответ строго в формате JSON с оценкой вероятностей для обоих направлений."
+            "NG Hybrid Architecture v2.0.\n"
+            f"BIAS={bias_upper}\n"
+            f"{bias_instr}\n\n"
+            "Верни СТРОГО валидный JSON-объект без markdown и без пояснений.\n"
+            "Схема JSON:\n"
+            "{{\n"
+            '  "signal": "BUY|SELL|HOLD",\n'
+            '  "confidence": 0-100,\n'
+            '  "bullish_prob": 0.0-1.0,\n'
+            '  "bearish_prob": 0.0-1.0,\n'
+            '  "reason": "string"\n'
+            "}}\n"
         )
 
-        return ChatPromptTemplate.from_messages([
-            ("system", system_msg),
-            ("human", "МАРКЕТ-ДАННЫЕ: {market_data}\nНОВОСТНОЙ КОНТЕКСТ: {news_context}")
-        ])
+        return ChatPromptTemplate.from_messages(
+            [
+                ("system", system_msg),
+                ("human", "marketdata:\n{marketdata}\n\nnewscontext:\n{newscontext}\n"),
+            ]
+        )
 
-    async def analyze(self, market_data: Any, news_context: str, bias: str) -> AnalysisResponse:
-        """
-        Основной метод анализа. 
-        Возвращает объект AnalysisResponse, что исключает ошибки атрибутов .get()
-        """
-        prompt_template = self._get_master_prompt(bias)
-        chain = prompt_template | self.llm
+    async def analyze(self, marketdata: Any, newscontext: str, bias: str = "neutral") -> AnalysisResponse:
+        prompt = self.get_master_prompt(bias)
+        chain = prompt | self.llm
 
         try:
-            # Прямой вызов возвращает уже валидированный объект AnalysisResponse
-            result = await chain.ainvoke({
-                "market_data": str(market_data),
-                "news_context": news_context
-            })
-            return result
+            resp = await chain.ainvoke(
+                {
+                    "marketdata": str(marketdata),
+                    "newscontext": newscontext or "",
+                }
+            )
+            payload = json.loads(resp.content)
+            return AnalysisResponse(**payload)
+
         except Exception as e:
-            self.logger.error(f"Критическая ошибка AI анализа: {e}")
-            # Safe Fallback в случае сбоя сети или API
+            self.logger.error(f"AI analysis error: {e}")
             return AnalysisResponse(
                 signal="HOLD",
                 confidence=0,
                 bullish_prob=0.5,
                 bearish_prob=0.5,
-                reason=f"Safe Fallback: {str(e)}"
+                reason=f"Safe Fallback: {e}",
             )
