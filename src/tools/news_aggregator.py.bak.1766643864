@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 class UnifiedNewsAgent:
     """
     Агент для сбора новостей через Tinkoff Invest API.
+    Работает через Tinkoff Invest SDK.
     """
 
     def __init__(self):
@@ -62,7 +63,7 @@ class UnifiedNewsAgent:
 
     async def refresh_news_file(self, path: str = "news.txt", figi: str = None) -> str:
         """
-        Перезаписывает news.txt авто-выжимкой (атомарно через temp + os.replace).
+        Перезаписывает news.txt авто-выжимкой, атомарно (temp file + os.replace).
         """
         text = await self.get_aggregated_sentiment_context(figi=figi)
 
@@ -78,6 +79,12 @@ class UnifiedNewsAgent:
         os.replace(tmp_name, target)
         logger.info(f"📝 news file updated: {target.resolve()}")
         return text
+
+    async def get_market_sentiment(self, news_text: str) -> str:
+        # Заглушка для совместимости
+        if "Ошибка" in news_text or "нет" in news_text:
+            return "neutral"
+        return "analyzing"
 
 
 if __name__ == "__main__":
@@ -96,6 +103,7 @@ if __name__ == "__main__":
             await agent.refresh_news_file(path=args.path, figi=args.figi)
         else:
             ctx = await agent.get_aggregated_sentiment_context(figi=args.figi)
+            print("\n--- СОБРАННЫЙ КОНТЕКСТ ---")
             print(ctx)
 
     logging.basicConfig(level=logging.INFO)
