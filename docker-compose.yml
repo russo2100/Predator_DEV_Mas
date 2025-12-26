@@ -1,15 +1,33 @@
 services:
   predator-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: predator_trading_bot
     restart: unless-stopped
     env_file:
       - .env
     environment:
-      - PYTHONPATH=/app
+      PYTHONPATH: /app
     working_dir: /app
     command: ["python", "-m", "src.main"]
     volumes:
       - ./memory:/app/memory
       - ./logs:/app/logs
       - ./shadow_agents_log.jsonl:/app/shadowagentslog.jsonl
+      - ./news.txt:/app/news.txt
+
+  news-refresh:
+    profiles:
+      - disabled
+    build: .
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+    command: ["python", "-m", "src.tools.news_aggregator", "--refresh", "--path", "/app/news.txt"]
+    volumes:
+      - ./news.txt:/app/news.txt
+      - ./src:/app/src
+    restart: "no"

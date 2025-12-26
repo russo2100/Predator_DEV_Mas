@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 
 class RiskAgent:
@@ -15,20 +15,16 @@ class RiskAgent:
     ВАЖНО: Shadow-лог печатает Risk по ключу "risk_score".
     """
 
-    # Синонимы сигналов, чтобы не зависеть от конкретного нейминга в main.py
-    _ENTRY_SIGNALS = {"BUY"}
-    _HOLD_SIGNALS = {"HOLD", "NOOP", "WAIT"}
-    _EXIT_SIGNALS = {"SELL", "EXIT", "CLOSE", "CLOSEALL", "SELLALL", "SELL1", "SELLHALF"}
-
     def __init__(self) -> None:
         # Hard rules (entry filters)
         self.MAX_ATR: float = 0.50
         self.MIN_CONFIDENCE: float = 60.0
-        self.RSI_OVERBOUGHT: float = 70.0
+
+        # RSI filters (симметрично для LONG и SHORT)
+        self.RSI_OVERBOUGHT: float = 70.0   # блокируем вход в LONG
+        self.RSI_OVERSOLD: float = 30.0     # блокируем вход в SHORT
 
         # Exit policy
-        # Важно: выходы обычно НЕ блокируем (снижение риска).
-        # Можно "смягчать" выход (частичный) только если захочешь — пока просто разрешаем.
         self.ALLOW_EXIT_ALWAYS: bool = True
 
     # ---- алиас под mainloop ----
@@ -48,24 +44,24 @@ class RiskAgent:
             "reason": str(reason or ""),
         }
 
-        # В твоём agent_state ключи сейчас "ATR/RSI" (верхний регистр) в JSONL inputstate,
-        # но на всякий читаем и нижний регистр тоже.
         atr = agent_state.get("ATR", agent_state.get("atr", 0))
         rsi = agent_state.get("RSI", agent_state.get("rsi", 50))
 
+        # ВАЖНО: в main.py ключи ATRSL/ATRTP (без подчёркивания),
+        # а в некоторых местах у тебя встречается ATR_SL/ATR_TP — читаем оба.
         market_data = {
             "ATR": self._to_float(atr, default=0.0),
             "RSI": self._to_float(rsi, default=50.0),
             "ticker": agent_state.get("ticker", "UNKNOWN"),
-            "ATR_SL": agent_state.get("ATR_SL"),
-            "ATR_TP": agent_state.get("ATR_TP"),
+            "ATRSL": agent_state.get("ATRSL", agent_state.get("ATR_SL")),
+            "ATRTP": agent_state.get("ATRTP", agent_state.get("ATR_TP")),
         }
 
         return self.evaluate_trade(alpha_signal=alpha_signal, market_data=market_data)
 
     # ---- базовая логика ----
     def evaluate_trade(self, alpha_signal: Dict[str, Any], market_data: Dict[str, Any]) -> Dict[str, Any]:
-        signal_type = str(alpha_signal.get("signal", "HOLD") or "HOLD").upper().strip()
+        raw_signal = str(alpha_signal.get("signal", "HOLD") or "HOLD").upper().strip()
         confidence = self._to_float(alpha_signal.get("confidence", 0), default=0.0)
         reason = str(alpha_signal.get("reason", "") or "")
 
@@ -80,67 +76,89 @@ class RiskAgent:
             "risk_score": 0,  # критично для ShadowAgents Risk=...
         }
 
-        # 0) HOLD / NOOP
-        if signal_type in self._HOLD_SIGNALS:
+        # 0) HOLD/NOOP/WAIT
+        if raw_signal in {"HOLD", "NOOP", "WAIT"}:
             verdict["allowed"] = False
-            verdict["reason"] = f"Signal is {signal_type}"
+            verdict["reason"] = f"Signal is {raw_signal}"
             verdict["risk_score"] = 5
             return verdict
 
-        # 1) EXIT / SELL: по умолчанию разрешаем (это снижение риска)
-        if signal_type in self._EXIT_SIGNALS:
+        # Нормализуем action-сигналы движка:
+        # BUY*, SELL* - это ВХОД (long/short) в твоём main.py
+        # CLOSE* / EXIT - это ВЫХОД
+        if raw_signal.startswith("BUY"):
+            side = "LONG"
+            intent = "ENTRY"
+        elif raw_signal.startswith("SELL"):
+            side = "SHORT"
+            intent = "ENTRY"
+        elif raw_signal.startswith("CLOSE") or raw_signal == "EXIT":
+            side = "UNKNOWN"
+            intent = "EXIT"
+        else:
+            side = "UNKNOWN"
+            intent = "UNKNOWN"
+
+        # 1) EXIT: по умолчанию разрешаем (снижение риска)
+        if intent == "EXIT":
             if self.ALLOW_EXIT_ALWAYS:
                 verdict["allowed"] = True
-                verdict["reason"] = f"Exit allowed for signal={signal_type}. {reason}".strip()
+                verdict["reason"] = f"Exit allowed for signal={raw_signal}. {reason}".strip()
                 verdict["risk_score"] = 10
-
-                # SL/TP для выхода не навязываем (пусть решатель/исполнитель решает),
-                # но оставим нули как явный "не модифицировать".
                 verdict["modified_sl"] = 0.0
                 verdict["modified_tp"] = 0.0
                 return verdict
 
-            # Если когда-нибудь захочешь "блокировать выход" (не рекомендую) — вот ветка:
             verdict["allowed"] = False
-            verdict["reason"] = f"Exit blocked by policy for signal={signal_type}"
+            verdict["reason"] = f"Exit blocked by policy for signal={raw_signal}"
             verdict["risk_score"] = 40
             return verdict
 
-        # 2) ENTRY / BUY: применяем строгие фильтры
-        if signal_type in self._ENTRY_SIGNALS:
-            # 2.1 Confidence
+        # 2) ENTRY: строгие фильтры
+        if intent == "ENTRY":
+            # 2.1 Confidence gate (качество сигнала)
             if confidence < self.MIN_CONFIDENCE:
                 verdict["allowed"] = False
-                verdict["reason"] = f"Low AI confidence: {confidence:.1f}% < {self.MIN_CONFIDENCE:.1f}%"
+                verdict["reason"] = (
+                    f"Low AI confidence: {confidence:.1f}% < {self.MIN_CONFIDENCE:.1f}%"
+                )
                 verdict["risk_score"] = 25
                 return verdict
 
-            # 2.2 ATR
+            # 2.2 ATR gate
             if atr > self.MAX_ATR:
                 verdict["allowed"] = False
                 verdict["reason"] = f"Extreme Volatility! ATR {atr:.4f} > {self.MAX_ATR:.4f}"
                 verdict["risk_score"] = 85
                 return verdict
 
-            # 2.3 RSI (для входа в LONG: если перекуплен — не входим)
-            if rsi > self.RSI_OVERBOUGHT:
+            # 2.3 RSI gate (симметрия)
+            if side == "LONG" and rsi > self.RSI_OVERBOUGHT:
                 verdict["allowed"] = False
-                verdict["reason"] = f"RSI Overbought: {rsi:.2f} > {self.RSI_OVERBOUGHT:.2f}"
+                verdict["reason"] = f"RSI Overbought (block LONG): {rsi:.2f} > {self.RSI_OVERBOUGHT:.2f}"
+                verdict["risk_score"] = 65
+                return verdict
+
+            if side == "SHORT" and rsi < self.RSI_OVERSOLD:
+                verdict["allowed"] = False
+                verdict["reason"] = f"RSI Oversold (block SHORT): {rsi:.2f} < {self.RSI_OVERSOLD:.2f}"
                 verdict["risk_score"] = 65
                 return verdict
 
             verdict["allowed"] = True
-            verdict["reason"] = "All entry risk checks passed"
+            verdict["reason"] = f"All entry risk checks passed ({side})"
             verdict["risk_score"] = 10
 
             # 2.4 SL/TP (по ATR)
-            verdict["modified_sl"] = self._to_float(market_data.get("ATR_SL"), default=atr * 2)
-            verdict["modified_tp"] = self._to_float(market_data.get("ATR_TP"), default=atr * 4)
+            atr_sl = market_data.get("ATRSL", market_data.get("ATR_SL"))
+            atr_tp = market_data.get("ATRTP", market_data.get("ATR_TP"))
+            verdict["modified_sl"] = self._to_float(atr_sl, default=atr * 2)
+            verdict["modified_tp"] = self._to_float(atr_tp, default=atr * 4)
             return verdict
 
         # 3) Неизвестный сигнал
         verdict["allowed"] = False
-        verdict["reason"] = f"Unknown signal: {signal_type}"
+        verdict["reason"] = f"Unknown signal: {raw_signal}"
         verdict["risk_score"] = 30
         return verdict
 

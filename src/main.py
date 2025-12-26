@@ -1028,21 +1028,20 @@ async def log_trade(
 
 
 def log_decision_block(
-    cycle: int,
-    price: float,
-    rsi: float,
-    trend: str,
+    cycle: int, 
+    price: float, 
+    rsi: float, 
+    trend: str, 
     lots: int,
-    ai_signal: str,
-    ai_confidence: float,
+    holding_hours: float, 
+    ai_signal: str, 
+    ai_confidence: float, 
     bias: str,
-    holding_hours: float,
-    minutes_to_clearing: int,
-    rules: dict,
-    data: dict | None = None,   # <-- ДОБАВИТЬ
-    action: str = "",
-    reason: str = "",
-    pnl_pct: float = 0.0
+    minutes_to_clearing: int, 
+    rules: dict, 
+    action: str, 
+    reason: str,
+    pnl_pct: float = 0.0  # ← Сделал опциональным с дефолтом 0.0
 ):
     """
     Выводит блок принятия решения в консоль и записывает его в shadow_agents_log.jsonl.
@@ -1066,11 +1065,7 @@ def log_decision_block(
         print(f"🔴 MIN_SELL: {rules['min_sell_price']:.3f}")
 
     emoji_map = {"BUY": "🚀", "SELL_ALL": "💥", "SELL_HALF": "⚖️", "NOOP": "😴", "BUY1": "🎯", "SELL1": "🎯", "BUY_ALL": "💪", "BUY_HALF": "⚡"}
-    market_state_emoji = {"IMPULSE_UP": "🚀", "IMPULSE_DOWN": "📉", "CORRECTION": "🎯", "RANGE": "⛔"}
     emoji = emoji_map.get(action, "🔍")
-    state_emoji = market_state_emoji.get(data.get("market_state", "RANGE"), "🔍")
-    print(f"📊 MARKET: {state_emoji} {data.get('market_state','RANGE')} | Strength: {data.get('impulse_strength', 0):.1f}% | Conf: {data.get('structure_confidence', 0)*100:.0f}%")
-
     print(f"➡️ ACTION: {emoji} {action}")
     if reason:
         print(f"📝 Reason: {reason}")
@@ -1139,12 +1134,11 @@ def decide_action(
     trend_5m: str,
     rsi: float,
     bias: str,
-    rules: Dict[str, Any],
-    market_state: str = "RANGE",
+    rules: Dict[str, Any]
 ) -> tuple[str, str]:
     """
     v2.0 Hybrid Architecture Decision Engine.
-def decide_action(..., rules: Dict[str, Any], market_state: str = "RANGE") -> tuple[str, str]:    Реализует Bayesian Scenario Engine и динамическую адаптивность.
+    Реализует Bayesian Scenario Engine и динамическую адаптивность.
     """
     # 1. Dynamic Confidence Correction (ТЗ п.3)
     # Если в новостях/правилах есть флаг экстремальной погоды или полярного вихря
@@ -1262,7 +1256,6 @@ async def main_loop():
     analyst = MarketAnalyst()
     planner = PlannerAgent()
     risk_agent = RiskAgent()
-    storage_agent = StorageAgent(api_key=settings.EIA_API_KEY.get_secret_value())
     executor = OrderExecutor(token)
     news_agent = UnifiedNewsAgent()
     shadow_adapter = MultiAgentShadowAdapter()
@@ -1335,17 +1328,6 @@ async def main_loop():
 
             # 6. RISK_AGENT оценивает рыночный риск
             print("🛡️ RISK_AGENT: Оценка волатильности и входа...")
-
-            # ---- STORAGE AGENT ----
-            print("📦 STORAGE_AGENT: Анализ запасов EIA...")
-            try:
-                storage_data = await storage_agent.get_storage_data()
-                if storage_data and storage_data.get("success"):
-                    storage_context = storage_agent.get_storage_context_str(storage_data)
-                    print(f"📦 {storage_context}")
-                    manual_news += f" | {storage_context}"
-            except Exception as e:
-                print(f"⚠️ Storage: {e}")
             risk_verdict = risk_agent.assess_risk(
                 alpha_signal={
                     "signal": news_result.signal,
@@ -1393,8 +1375,7 @@ async def main_loop():
                 trend_5m=trend_5m,
                 rsi=rsi_val,
                 bias=final_bias,  # из PLANNER, а не из rules
-                rules=plan_result,  # весь вывод PLANNER
-                market_state=data.get("market_state", "RANGE")  # 🆕 Market Structure
+                rules=plan_result  # весь вывод PLANNER
             )
 
             # 10. Исполнение ордеров (фильтр по риску)
@@ -1419,7 +1400,6 @@ async def main_loop():
                 bias=final_bias,
                 minutes_to_clearing=get_minutes_to_clearing(),
                 rules=plan_result,
-                data=data,
                 action=action,
                 reason=action_reason,
             )

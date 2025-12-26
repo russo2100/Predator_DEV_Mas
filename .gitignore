@@ -41,3 +41,36 @@ src/config/settings.py
 _dump_from_container_*
 _dump_from_container_*
 _dump_from_container_*
+
+# secrets
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# logs & runtime
+logs/
+*.log
+*.jsonl
+news.txt
+news.txt.dir.bak*
+dumpfromcontainer*/
+*dumpfromcontainer*
+
+# IDE
+.vscode/
+.idea/
+
+# backups
+*.bak*
+*.broken*
