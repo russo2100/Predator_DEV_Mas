@@ -80,3 +80,9 @@ audit/
 
 # editor / backups
 *.bak.*
+
+# local audits / notes
+audit/
+
+# backups
+*.bak.*
