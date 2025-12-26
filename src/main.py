@@ -1134,7 +1134,8 @@ def decide_action(
     trend_5m: str,
     rsi: float,
     bias: str,
-    rules: Dict[str, Any]
+    rules: Dict[str, Any],
+    market_state: str = "RANGE"
 ) -> tuple[str, str]:
     """
     v2.0 Hybrid Architecture Decision Engine.
@@ -1155,6 +1156,11 @@ def decide_action(
 
     # 3. ЛОГИКА ВХОДА (Если позиции нет)
     if lots == 0:
+        # ТЕСТОВЫЙ ВХОД: HOLD + Conf >= 65 + Bullish >= 0.40 при импульсе
+        market_state_u = str(market_state or "RANGE").upper().strip()
+        if (ai_signal == "HOLD" and ai_confidence >= 65 and bullish_prob >= 0.40 and 
+            rsi <= 80 and market_state_u in ("IMPULSE_UP", "UP")):
+            return "BUY1", f"TEST ENTRY: HOLD+Conf {ai_confidence}% + Bull {bullish_prob:.2f} + RSI {rsi:.1f}"
         # Сценарий LONG
         if ai_signal == "BUY":
             if effective_confidence >= min_entry_conf:
@@ -1392,7 +1398,8 @@ async def main_loop():
                 trend_5m=trend_5m,
                 rsi=rsi_val,
                 bias=final_bias,
-                rules=plan_result
+                rules=plan_result,
+                market_state=data.get("marketstate", "RANGE")
             )
             
             # 10. Исполнение ордеров (фильтр по риску/погоде)
