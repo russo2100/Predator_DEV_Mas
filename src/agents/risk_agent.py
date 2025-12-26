@@ -24,6 +24,13 @@ class RiskAgent:
         self.RSI_OVERBOUGHT: float = 70.0   # блокируем вход в LONG
         self.RSI_OVERSOLD: float = 30.0     # блокируем вход в SHORT
 
+        # Variant B: allow buying in IMPULSE_UP even if RSI is high, but with constraints
+        self.ALLOW_IMPULSE_RSI_OVERRIDE: bool = True
+        self.IMPULSE_UP_RSI_MAX: float = 85.0
+        self.IMPULSE_UP_MIN_CONFIDENCE: float = 72.0
+        self.IMPULSE_UP_MAX_ATR: float = 0.70
+
+
         # Exit policy
         self.ALLOW_EXIT_ALWAYS: bool = True
 
@@ -67,6 +74,9 @@ class RiskAgent:
 
         atr = self._to_float(market_data.get("ATR", 0), default=0.0)
         rsi = self._to_float(market_data.get("RSI", 50), default=50.0)
+
+        market_state = str(market_data.get("market_state", market_data.get("marketstate", "RANGE")) or "RANGE").upper().strip()
+
 
         verdict: Dict[str, Any] = {
             "allowed": False,
@@ -133,11 +143,30 @@ class RiskAgent:
                 return verdict
 
             # 2.3 RSI gate (симметрия)
+            # 2.3 RSI gate (LONG): normally block overbought, but allow in IMPULSE_UP with constraints (Variant B)
             if side == "LONG" and rsi > self.RSI_OVERBOUGHT:
+                if (
+                    self.ALLOW_IMPULSE_RSI_OVERRIDE
+                    and market_state == "IMPULSE_UP"
+                    and confidence >= self.IMPULSE_UP_MIN_CONFIDENCE
+                    and atr <= self.IMPULSE_UP_MAX_ATR
+                    and rsi <= self.IMPULSE_UP_RSI_MAX
+                ):
+                    verdict["allowed"] = True
+                    verdict["reason"] = (
+                        f"IMPULSE_UP override: allow LONG despite RSI {rsi:.2f} > {self.RSI_OVERBOUGHT:.2f}; "
+                        f"conf={confidence:.1f} atr={atr:.4f}"
+                    )
+                    verdict["risk_score"] = 20
+                    verdict["modified_sl"] = self._to_float(market_data.get("ATR_SL"), default=atr * 1.5)
+                    verdict["modified_tp"] = self._to_float(market_data.get("ATR_TP"), default=atr * 3.0)
+                    return verdict
+
                 verdict["allowed"] = False
                 verdict["reason"] = f"RSI Overbought (block LONG): {rsi:.2f} > {self.RSI_OVERBOUGHT:.2f}"
                 verdict["risk_score"] = 65
                 return verdict
+
 
             if side == "SHORT" and rsi < self.RSI_OVERSOLD:
                 verdict["allowed"] = False

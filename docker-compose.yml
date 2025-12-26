@@ -15,7 +15,8 @@ services:
       - ./memory:/app/memory
       - ./logs:/app/logs
       - ./shadow_agents_log.jsonl:/app/shadowagentslog.jsonl
-      - ./news.txt:/app/news.txt
+      - ./news_fire.txt:/app/news_fire.txt:ro
+
 
   news-refresh:
     profiles:
@@ -26,8 +27,8 @@ services:
       - .env
     environment:
       - PYTHONPATH=/app
-    command: ["python", "-m", "src.tools.news_aggregator", "--refresh", "--path", "/app/news.txt"]
+    command: ["python", "-m", "src.tools.news_aggregator", "--refresh", "--path", "/app/news_generated.txt"]
     volumes:
-      - ./news.txt:/app/news.txt
+      - ./news.txt:/app/news.txt:ro
       - ./src:/app/src
     restart: "no"

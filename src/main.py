@@ -1304,16 +1304,26 @@ async def main_loop():
             weather_str = weather_monitor.get_weather_context_str(weather_data)
             print(f"📡 {weather_str}")
 
-            # 4. Фундаментал и новости (news.txt)
+            
+            # 4. Фундаментал и новости (только news_fire.txt)
+            manual_news = ""
             try:
-                with open("news.txt", "r", encoding="utf-8") as f:
+                with open("news_fire.txt", "r", encoding="utf-8") as f:
                     manual_news = f.read().strip()
+            except FileNotFoundError:
+                print("⚠️ news_fire.txt не найден (создайте файл для ручных новостей)")
             except Exception as e:
-                print(f"⚠️ Ошибка чтения news.txt: {e}")
-                manual_news = ""
+                print(f"⚠️ Ошибка чтения news_fire.txt: {e}")
 
+            print(f"📰 Новости: прочитано {len(manual_news)} символов (news_fire.txt)")
+
+            # ВАЖНО: parse_trading_rules_from_news() читает константу NEWSFILE. [file:5]
+            # Если она объявлена в этом модуле — переключаем её на news_fire.txt.
             rules = parse_trading_rules_from_news()
             current_bias = rules.get("bias", "neutral")
+
+
+
 
             # 5. NEWS_AGENT анализирует новости + техничку
             print("📰 NEWS_AGENT: Анализ новостей и фундамента...")
@@ -1338,9 +1348,14 @@ async def main_loop():
                     "ATR": data.get("ATR", 0.1),
                     "RSI": rsi_val,
                     "ATRSL": data.get("ATRSL", 0.05),
-                    "ATRTP": data.get("ATRTP", 0.15)
+                    "ATRTP": data.get("ATRTP", 0.15),
+                      "market_state": data.get("marketstate", data.get("market_state", "RANGE"))
                 }
             )
+
+            risk_verdict_allowed = bool(risk_verdict.get("allowed", False))
+            risk_allowed = risk_verdict_allowed
+
             risk_allowed = risk_verdict["allowed"]
             print(f"✓ Risk Verdict: {risk_verdict['reason']} | Risk Score: {risk_verdict['risk_score']}")
 
@@ -1353,17 +1368,19 @@ async def main_loop():
                 "news_summary": manual_news[:500]
             }
             plan_result = planner.create_plan(market_context)
-            print(f"🧩 plan_result keys: {list(plan_result.keys())} | plan_result={plan_result}")
-            final_bias = plan_result["bias"]
-            final_riskmode = plan_result.get("risk_mode") or plan_result.get("risk_mode") or plan_result.get("riskMode") or "CONSERVATIVE"
-            print(f"📋 Plan: Bias={final_bias}, RiskMode={final_riskmode}")
-
+            final_bias = plan_result.get("bias", current_bias)
+            
             # 8. Интеграция погоды
+            weather_allowed = True
+            block_reason = ""
             if weather_data.get("is_extreme"):
                 print("⚠️ WEATHER_ALERT: Экстремальные условия!")
-                final_riskmode = "CONSERVATIVE"
-                risk_allowed = False  # Блокируем вход при экстремуме
-
+                weather_allowed = False
+                block_reason = "WEATHER_ALERT: extreme conditions -> block entries"
+                risk_allowed = False
+            
+            trade_allowed = risk_allowed and weather_allowed
+            
             # 9. DECISION_BLOCK: финальное решение
             action, action_reason = decide_action(
                 lots=current_lots,
@@ -1374,18 +1391,20 @@ async def main_loop():
                 bearish_prob=news_result.bearish_prob,
                 trend_5m=trend_5m,
                 rsi=rsi_val,
-                bias=final_bias,  # из PLANNER, а не из rules
-                rules=plan_result  # весь вывод PLANNER
+                bias=final_bias,
+                rules=plan_result
             )
-
-            # 10. Исполнение ордеров (фильтр по риску)
-            if risk_allowed and action != "NOOP":
+            
+            # 10. Исполнение ордеров (фильтр по риску/погоде)
+            if trade_allowed and action != "NOOP":
                 direction = "BUY" if action.startswith("BUY") else "SELL"
-                qty = 1  # вычислить из action
-                print(f"➡️ EXECUTION: {action} | Risk Score: {risk_verdict['risk_score']}")
+                qty = 1
+                print(f"➡️ EXECUTION: {action} | Risk Score: {risk_verdict.get('risk_score', 0)}")
                 await post_order_guarded(executor, FIGI_NRF6, direction, qty, why=action_reason)
-            elif not risk_allowed and action != "NOOP":
-                print(f"🚫 BLOCKED by Risk: {risk_verdict['reason']}")
+            elif action != "NOOP":
+                why_block = block_reason or risk_verdict.get("reason", "Blocked")
+                print(f"🚫 BLOCKED: {why_block}")
+
 
             # 11. Логирование в shadow_agents_log.jsonl
             log_decision_block(
