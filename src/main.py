@@ -7,6 +7,7 @@ import uuid
 import aiohttp
 from typing import Dict, Any, Literal, Optional
 from datetime import datetime, timedelta, timezone, time
+
 from src.agents.analyst import MarketAnalyst
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -16,13 +17,16 @@ from t_tech.invest import AsyncClient, OrderDirection, OrderType, CandleInterval
 from pathlib import Path
 import os
 import time
-from src.core.multi_agent_adapter import MultiAgentShadowAdapter 
+from src.core.multi_agent_adapter import MultiAgentShadowAdapter
 from src.agents.planner import PlannerAgent
 from src.agents.risk_agent import RiskAgent
 from src.tools.news_aggregator import UnifiedNewsAgent
+from src.core.gwdd_engine import GWDDEngine, GWDDConfig
+from src.shared_state import SharedTradingState
 import datetime as dt
 import pytz
 from src.services.weather_monitor import SynopticMonitor
+
 
 
 
@@ -1258,26 +1262,37 @@ async def post_order_guarded(
 async def main_loop():
     # Теперь это сработает для всех ключей
     token = settings.TINKOFF_TOKEN.get_secret_value()
-    
+
     analyst = MarketAnalyst()
     planner = PlannerAgent()
+
+    # === GWDD ENGINE INITIALIZATION ===
+    gwdd_config = GWDDConfig(
+        sigma_confidence=15.0,
+        sigma_rsi=12.0,
+        sigma_prob=0.20,
+        global_min_weight=0.50,          # GWDD < 0.5 = почти всегда SKIP
+        min_weight_conservative=0.65,    # CONSERVATIVE
+        min_weight_moderate=0.55,        # MODERATE
+        min_weight_aggressive=0.45,      # AGGRESSIVE
+    )
+    gwdd_engine = GWDDEngine(gwdd_config)
     risk_agent = RiskAgent()
     executor = OrderExecutor(token)
     news_agent = UnifiedNewsAgent()
-    shadow_adapter = MultiAgentShadowAdapter()
     weather_monitor = SynopticMonitor()
+    sharedstate = SharedTradingState()
 
-    
     print("👻 Hybrid Architecture v2.0: Режим активного мониторинга запущен.")
     await send_telegram("🚀 Predator v2.0: Bayesian Engine + Synoptic Monitor активны.")
 
     cycle = 0
     position_timer = PositionTimer()
-    MAX_LOTS_ALLOWED = 8 
+    MAX_LOTS_ALLOWED = 8
 
     while True:
         try:
-            now_msk = dt.datetime.now(pytz.timezone('Europe/Moscow'))
+            now_msk = dt.datetime.now(pytz.timezone("Europe/Moscow"))
             is_open, status_msg = get_market_status()
 
             if not is_open:
@@ -1310,7 +1325,6 @@ async def main_loop():
             weather_str = weather_monitor.get_weather_context_str(weather_data)
             print(f"📡 {weather_str}")
 
-            
             # 4. Фундаментал и новости (только news_fire.txt)
             manual_news = ""
             try:
@@ -1320,16 +1334,10 @@ async def main_loop():
                 print("⚠️ news_fire.txt не найден (создайте файл для ручных новостей)")
             except Exception as e:
                 print(f"⚠️ Ошибка чтения news_fire.txt: {e}")
-
             print(f"📰 Новости: прочитано {len(manual_news)} символов (news_fire.txt)")
 
-            # ВАЖНО: parse_trading_rules_from_news() читает константу NEWSFILE. [file:5]
-            # Если она объявлена в этом модуле — переключаем её на news_fire.txt.
             rules = parse_trading_rules_from_news()
             current_bias = rules.get("bias", "neutral")
-
-
-
 
             # 5. NEWS_AGENT анализирует новости + техничку
             print("📰 NEWS_AGENT: Анализ новостей и фундамента...")
@@ -1337,10 +1345,14 @@ async def main_loop():
             news_result = await analyst.analyze(
                 marketdata=data,
                 newscontext=full_context,
-                bias=current_bias
+                bias=current_bias,
             )
+
             print(f"🤖 AI: {news_result.signal} | Conf: {news_result.confidence}%")
-            print(f"📈 Prob: Bullish {news_result.bullish_prob*100:.0f}% | Bearish {news_result.bearish_prob*100:.0f}%")
+            print(
+                f"📈 Prob: Bullish {news_result.bullish_prob*100:.0f}% | "
+                f"Bearish {news_result.bearish_prob*100:.0f}%"
+            )
 
             # 6. RISK_AGENT оценивает рыночный риск
             print("🛡️ RISK_AGENT: Оценка волатильности и входа...")
@@ -1348,22 +1360,23 @@ async def main_loop():
                 alpha_signal={
                     "signal": news_result.signal,
                     "confidence": news_result.confidence,
-                    "reason": ""
+                    "reason": "",
                 },
                 market_data={
                     "ATR": data.get("ATR", 0.1),
                     "RSI": rsi_val,
                     "ATRSL": data.get("ATRSL", 0.05),
                     "ATRTP": data.get("ATRTP", 0.15),
-                      "market_state": data.get("marketstate", data.get("market_state", "RANGE"))
-                }
+                    "market_state": data.get(
+                        "marketstate", data.get("market_state", "RANGE")
+                    ),
+                },
             )
-
-            risk_verdict_allowed = bool(risk_verdict.get("allowed", False))
-            risk_allowed = risk_verdict_allowed
-
-            risk_allowed = risk_verdict["allowed"]
-            print(f"✓ Risk Verdict: {risk_verdict['reason']} | Risk Score: {risk_verdict['risk_score']}")
+            risk_allowed = bool(risk_verdict.get("allowed", False))
+            print(
+                f"✓ Risk Verdict: {risk_verdict['reason']} | "
+                f"Risk Score: {risk_verdict['risk_score']}"
+            )
 
             # 7. PLANNER синтезирует стратегию
             print("🧠 PLANNER: Синтез торговой стратегии...")
@@ -1371,12 +1384,12 @@ async def main_loop():
                 "ticker": "NG",
                 "trend_d1": trend_5m,
                 "trend_h1": trend_5m,
-                "news_summary": manual_news[:500]
+                "news_summary": manual_news[:500],
             }
             plan_result = planner.create_plan(market_context)
             final_bias = plan_result.get("bias", current_bias)
-            
-            # 8. Интеграция погоды
+
+            # 8. Погода как фильтр
             weather_allowed = True
             block_reason = ""
             if weather_data.get("is_extreme"):
@@ -1384,10 +1397,49 @@ async def main_loop():
                 weather_allowed = False
                 block_reason = "WEATHER_ALERT: extreme conditions -> block entries"
                 risk_allowed = False
-            
+
             trade_allowed = risk_allowed and weather_allowed
+
+            # === GWDD INTEGRATION: Gaussian Weight Distribution Dynamics ===
+            print("📊 GWDD: Расчет веса входа...")
             
-            # 9. DECISION_BLOCK: финальное решение
+            entry_weight, gwdd_breakdown = gwdd_engine.calculate_entry_weight(
+                ai_signal=news_result.signal,
+                confidence=news_result.confidence,
+                bullish_prob=news_result.bullish_prob,
+                bearish_prob=news_result.bearish_prob,
+                rsi=rsi_val,
+                market_state=data.get("marketstate", "RANGE"),
+                risk_mode=sharedstate.risk_mode
+
+            )
+            
+            should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
+                entry_weight=entry_weight,
+                risk_mode=sharedstate.risk_mode,
+                ai_signal=news_result.signal
+            )
+            
+            position_size = gwdd_engine.get_position_sizing(
+                entry_weight=entry_weight,
+                max_lots=MAX_LOTS_ALLOWED,
+                risk_mode=sharedstate.risk_mode,
+                rsi=rsi_val,
+            )            
+            print(f"⚖️ GWDD Weight: {entry_weight:.3f} | Lots: {position_size}")
+            print(f"   {gwdd_reason}")
+            
+            # Обновляем shared_state
+            sharedstate.gwdd_weight = entry_weight
+            sharedstate.suggested_lots = position_size
+            
+            # GWDD может перекрыть решение risk_agent
+            if not should_enter and news_result.signal in ["BUY", "SELL"]:
+                trade_allowed = False
+                block_reason = f"GWDD_BLOCK: {gwdd_reason}"
+
+
+            # 9. DECISION_BLOCK
             action, action_reason = decide_action(
                 lots=current_lots,
                 max_lots=MAX_LOTS_ALLOWED,
@@ -1399,21 +1451,25 @@ async def main_loop():
                 rsi=rsi_val,
                 bias=final_bias,
                 rules=plan_result,
-                market_state=data.get("marketstate", "RANGE")
+                market_state=data.get("marketstate", "RANGE"),
             )
-            
-            # 10. Исполнение ордеров (фильтр по риску/погоде)
+
             if trade_allowed and action != "NOOP":
                 direction = "BUY" if action.startswith("BUY") else "SELL"
                 qty = 1
-                print(f"➡️ EXECUTION: {action} | Risk Score: {risk_verdict.get('risk_score', 0)}")
-                await post_order_guarded(executor, FIGI_NRF6, direction, qty, why=action_reason)
+                print(
+                    f"➡️ EXECUTION: {action} | "
+                    f"Risk Score: {risk_verdict.get('risk_score', 0)}"
+                )
+                await post_order_guarded(
+                    executor, FIGI_NRF6, direction, qty, why=action_reason
+                )
             elif action != "NOOP":
-                why_block = block_reason or risk_verdict.get("reason", "Blocked")
+                why_block = (
+                    block_reason or risk_verdict.get("reason", "Blocked by filter")
+                )
                 print(f"🚫 BLOCKED: {why_block}")
 
-
-            # 11. Логирование в shadow_agents_log.jsonl
             log_decision_block(
                 cycle=cycle,
                 price=current_price,
@@ -1430,15 +1486,15 @@ async def main_loop():
                 reason=action_reason,
             )
 
-            # 12. Ожидание 60 сек
             await asyncio.sleep(60)
-
 
         except Exception as e:
             print(f"💥 Critical Error in main_loop: {e}")
             import traceback
+
             traceback.print_exc()
             await asyncio.sleep(10)
+
 
 
 
