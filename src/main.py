@@ -1150,7 +1150,9 @@ def decide_action(
     bias: str,
     rules: Dict[str, Any],
     market_state: str = "RANGE",
-    minutes_to_clearing: int = 999
+    minutes_to_clearing: int = 999,
+    current_volume: int = 0,
+    avg_volume: int = 1
 ) -> tuple[str, str, dict]:  # ← ИЗМЕНЕНО: добавлен dict с метаданными
     """
     v2.0 Hybrid Architecture Decision Engine.
@@ -1194,11 +1196,15 @@ def decide_action(
         
         avg_conf = sum(buy_signals_history[-3:]) / 3
         
-        if (avg_conf >= 65 and 
+        volume_confirmed = (current_volume >= avg_volume * 1.2) if avg_volume > 0 else True
+        
+        if (avg_conf >= 65 and
             rsi < 75 and
-            bullish_prob > 0.55):
+            bullish_prob > 0.55 and
+            volume_confirmed):
             
             metadata = {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
+            
     # 2b. НАКОПЛЕНИЕ ИСТОРИИ SELL-СИГНАЛОВ
     if ai_signal == "SELL":
         consecutive_sell_signals += 1
@@ -1216,9 +1222,12 @@ def decide_action(
 
         avg_conf_sell = sum(sell_signals_history[-3:]) / 3
 
+        volume_confirmed_sell = (current_volume >= avg_volume * 1.2) if avg_volume > 0 else True
+        
         if (avg_conf_sell >= 65 and
             rsi > 25 and
-            bearish_prob > 0.55):
+            bearish_prob > 0.55 and
+            volume_confirmed_sell):
 
             metadata = {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
             return "SELL1", f"🚨 FORCED ENTRY SHORT: 3 consecutive SELL (avg Conf {avg_conf_sell:.1f}%) | RSI {rsi:.1f}", metadata
@@ -1385,6 +1394,9 @@ async def main_loop():
             current_price = float(data["close"])
             rsi_val = float(data.get("RSI", 50.0))
             trend_5m = data.get("trend", "FLAT")
+            current_volume = int(candles["volume"].iloc[-1]) if not candles.empty and "volume" in candles.columns else 0
+            avg_volume_20 = int(candles["volume"].tail(20).mean()) if len(candles) >= 20 and "volume" in candles.columns else 1
+
 
             # 3. Синоптический мониторинг (погода)
             print("🌡️ Опрос метеослужб (Open-Meteo)...")
@@ -1485,8 +1497,6 @@ async def main_loop():
                 bearish_prob=news_result.bearish_prob,
                 rsi=rsi_val,
                 market_state=data.get("marketstate", "RANGE"),
-
-
                 risk_mode=sharedstate.risk_mode
 
             )
