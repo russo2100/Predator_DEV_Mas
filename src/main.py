@@ -1292,14 +1292,14 @@ def decide_action(
 
     # 7. Static Bias Override
     # 6.5. EXTREME OVERSOLD: Агрессивный вход при RSI < 20 (NEUTRAL bias)
-    if rsi < 20 and lots == 0 and bullish_prob > 0.15:
+    if rsi < 20 and lots == 0 and bullish_prob > 0.15 and ai_signal != "SELL":
         return "BUY1", f"🚨 EXTREME OVERSOLD: RSI {rsi:.1f} < 20 | Bull {bullish_prob:.2f} | Mean reversion", metadata
 
     # 6.6. EXTREME OVERBOUGHT: Агрессивный вход при RSI > 80 (NEUTRAL bias)
-    if rsi > 80 and lots == 0 and bearish_prob > 0.15:
+    if rsi > 80 and lots == 0 and bearish_prob > 0.15 and ai_signal != "BUY":
         return "SELL1", f"🚨 EXTREME OVERBOUGHT: RSI {rsi:.1f} > 80 | Bear {bearish_prob:.2f} | Mean reversion", metadata
 
-    if rsi < 20 and bias == "bearish" and bullish_prob > 0.25:
+    if rsi < 20 and bias == "bearish" and bullish_prob > 0.25 and ai_signal != "SELL":
         return "BUY1", "Extreme RSI mean reversion attempt (Hedge)", metadata
 
     return "NOOP", f"Waiting. B:{bullish_prob:.2f} S:{bearish_prob:.2f} RSI:{rsi:.1f}", metadata
