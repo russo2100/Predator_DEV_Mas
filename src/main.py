@@ -1152,6 +1152,7 @@ def decide_action(
     market_state: str = "RANGE",
     minutes_to_clearing: int = 999,
     current_volume: int = 0,
+    atr: float = 0.1,
     avg_volume: int = 1
 ) -> tuple[str, str, dict]:  # ← ИЗМЕНЕНО: добавлен dict с метаданными
     """
@@ -1162,6 +1163,15 @@ def decide_action(
     
     Returns: (action, reason, metadata) где metadata = {"forced_entry": bool, "consecutive_signals": int, "avg_confidence": float}
     """
+    # Адаптивный порог confidence на основе ATR
+    # Высокая волатильность (ATR > 0.15) → повышаем порог до 70%
+    # Низкая волатильность (ATR < 0.10) → снижаем до 60%
+    if atr > 0.15:
+        adaptive_threshold = 70
+    elif atr < 0.10:
+        adaptive_threshold = 60
+    else:
+        adaptive_threshold = 65
     global consecutive_buy_signals, buy_signals_history, consecutive_sell_signals, sell_signals_history
     
     # Дефолтные метаданные
@@ -1185,7 +1195,7 @@ def decide_action(
         consecutive_buy_signals = 0
         buy_signals_history.clear()
     
-    # 2. FORCED ENTRY: 3 BUY подряд + avg Conf ≥65%
+    # 2. FORCED ENTRY: 3 BUY подряд + avg Conf ≥ adaptive_threshold
     if clearing_block:
         return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min) - no forced entry", metadata
 
@@ -1198,12 +1208,13 @@ def decide_action(
         
         volume_confirmed = (current_volume >= avg_volume * 1.2) if avg_volume > 0 else True
         
-        if (avg_conf >= 65 and
+        if (avg_conf >= adaptive_threshold and
             rsi < 75 and
             bullish_prob > 0.55 and
             volume_confirmed):
             
             metadata = {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
+            return "BUY1", f"🚨 FORCED ENTRY: 3 consecutive BUY (threshold {adaptive_threshold}%, avg Conf {avg_conf:.1f}%) | RSI {rsi:.1f}", metadata
             
     # 2b. НАКОПЛЕНИЕ ИСТОРИИ SELL-СИГНАЛОВ
     if ai_signal == "SELL":
@@ -1224,15 +1235,14 @@ def decide_action(
 
         volume_confirmed_sell = (current_volume >= avg_volume * 1.2) if avg_volume > 0 else True
         
-        if (avg_conf_sell >= 65 and
+        if (avg_conf_sell >= adaptive_threshold and
             rsi > 25 and
             bearish_prob > 0.55 and
             volume_confirmed_sell):
 
             metadata = {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
-            return "SELL1", f"🚨 FORCED ENTRY SHORT: 3 consecutive SELL (avg Conf {avg_conf_sell:.1f}%) | RSI {rsi:.1f}", metadata
+            return "SELL1", f"🚨 FORCED ENTRY SHORT: 3 consecutive SELL (threshold {adaptive_threshold}%, avg Conf {avg_conf_sell:.1f}%) | RSI {rsi:.1f}", metadata
 
-            return "BUY1", f"🚨 FORCED ENTRY: 3 consecutive BUY (avg Conf {avg_conf:.1f}%) | RSI {rsi:.1f}", metadata
     
     # 3. Dynamic Confidence Correction
     is_extreme = any(word in str(rules).lower() for word in ["vortex", "extreme", "arctic", "noaa"])
@@ -1539,7 +1549,24 @@ async def main_loop():
                 bias=final_bias,
                 rules=plan_result,
                 market_state=data.get("marketstate", "RANGE"),
+                minutes_to_clearing=get_minutes_to_clearing(),
+                current_volume=current_volume,
+                avg_volume=avg_volume_20,
+                atr=data.get("ATR", 0.1)
             )
+
+
+
+
+
+
+
+
+
+
+
+
+
 
             if trade_allowed and action != "NOOP":
                 direction = "BUY" if action.startswith("BUY") else "SELL"
