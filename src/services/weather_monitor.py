@@ -53,11 +53,14 @@ class SynopticMonitor:
                 raise ValueError("Open-Meteo: daily.temperature_2m_min is empty")
 
             # Базовая логика: для NG критичен холод.
-            # Ниже 10°C — рост потребления; ниже 0°C — экстремум; выше 25°C — медвежий фактор.
+            # Ниже 10°C — рост потребления; ниже 0°C — критический, ниже 5°C — экстремум; выше 25°C — медвежий фактор.
             impact_score = 0.0
             is_extreme = False
 
             if min_temp < 0.0:
+                impact_score = 0.9  # критический холод
+                is_extreme = True
+            elif min_temp < 5.0:
                 impact_score = 0.8  # сильный бычий фактор
                 is_extreme = True
             elif min_temp < 10.0:
