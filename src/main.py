@@ -89,6 +89,14 @@ COOLDOWN_AFTER_PROFIT_MINUTES = 0  # нет охлаждения после пр
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 last_trade_time = None
 last_trade_was_profit = True  # предполагаем, что первая сделка будет прибыльной
+consecutive_buy_signals = 0  # Счётчик последовательных BUY-сигналов
+buy_signals_history = []     # История [confidence] за последние 5 BUY
+
+# Forced Entry: SELL tracking
+consecutive_sell_signals = 0  # Счётчик последовательных SELL-сигналов
+sell_signals_history = []     # История Confidence для SELL (последние 5)
+last_news_result = None      # Кэш результата NEWS_AGENT
+news_cache_cycle = 0         # Номер цикла последнего обновления
 last_sleep_log_time: Optional[dt.datetime] = None
 
 
@@ -1032,20 +1040,23 @@ async def log_trade(
 
 
 def log_decision_block(
-    cycle: int, 
-    price: float, 
-    rsi: float, 
-    trend: str, 
+    cycle: int,
+    price: float,
+    rsi: float,
+    trend: str,
     lots: int,
-    holding_hours: float, 
-    ai_signal: str, 
-    ai_confidence: float, 
+    holding_hours: float,
+    ai_signal: str,
+    ai_confidence: float,
     bias: str,
-    minutes_to_clearing: int, 
-    rules: dict, 
-    action: str, 
+    minutes_to_clearing: int,
+    rules: dict,
+    action: str,
     reason: str,
-    pnl_pct: float = 0.0  # ← Сделал опциональным с дефолтом 0.0
+    pnl_pct: float = 0.0,
+    forced_entry: bool = False,  # ← НОВЫЙ ПАРАМЕТР
+    consecutive_signals: int = 0,  # ← Сколько BUY подряд
+    avg_confidence: float = 0.0  # ← Средняя уверенность
 ):
     """
     Выводит блок принятия решения в консоль и записывает его в shadow_agents_log.jsonl.
@@ -1062,6 +1073,10 @@ def log_decision_block(
     print(f"💰 Price: {price:.3f} | RSI: {rsi:.1f} | Trend: {trend}")
     print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
     print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
+
+    # ← НОВЫЙ ВЫВОД для форсированных входов
+    if forced_entry:
+        print(f"🚨 FORCED ENTRY: {consecutive_signals} consecutive BUY (avg Conf {avg_confidence:.1f}%)")
 
     if rules.get('max_buy_price'):
         print(f"🟢 MAX_BUY: {rules['max_buy_price']:.3f}")
@@ -1094,7 +1109,10 @@ def log_decision_block(
             "ai_confidence": ai_confidence,
             "action": action,
             "reason": reason,
-            "rules": rules
+            "rules": rules,
+            "forced_entry": forced_entry,  # ← НОВОЕ ПОЛЕ
+            "consecutive_signals": consecutive_signals,  # ← Счётчик BUY
+            "avg_confidence": avg_confidence  # ← Средняя уверенность
         }
     }
 
@@ -1118,14 +1136,6 @@ def log_decision_block(
         print(f"⚠️ WARN: Unexpected error in logging: {type(e).__name__}: {e}")
 
 
-    # 3. Запись в файл shadow_agents_log.jsonl
-    try:
-        log_file = "shadow_agents_log.jsonl"
-        with open(log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print(f"❌ Ошибка записи в shadow_agents_log.jsonl: {e}")
-
 
 
 def decide_action(
@@ -1140,71 +1150,120 @@ def decide_action(
     bias: str,
     rules: Dict[str, Any],
     market_state: str = "RANGE"
-) -> tuple[str, str]:
+) -> tuple[str, str, dict]:  # ← ИЗМЕНЕНО: добавлен dict с метаданными
     """
     v2.0 Hybrid Architecture Decision Engine.
     Реализует Bayesian Scenario Engine и динамическую адаптивность.
+    + First Entry Aggressive: форсированный вход после 3 BUY/SELL подряд (avg Conf ≥65%)
+    + Обработка ошибок OpenRouter (фильтрация NEUTRAL с Conf=0)
+    
+    Returns: (action, reason, metadata) где metadata = {"forced_entry": bool, "consecutive_signals": int, "avg_confidence": float}
     """
-    # 1. Dynamic Confidence Correction (ТЗ п.3)
-    # Если в новостях/правилах есть флаг экстремальной погоды или полярного вихря
+    global consecutive_buy_signals, buy_signals_history, consecutive_sell_signals, sell_signals_history
+    
+    # Дефолтные метаданные
+    metadata = {"forced_entry": False, "consecutive_signals": 0, "avg_confidence": 0.0}
+    
+    # 0. ОБРАБОТКА ОШИБОК OPENROUTER
+    if ai_signal == "NEUTRAL" and ai_confidence == 0:
+        print("⚠️ OpenRouter error detected (NEUTRAL/0%) - keeping previous state")
+        return "NOOP", "OpenRouter lag detected - skipping cycle", metadata
+    
+    # 1. НАКОПЛЕНИЕ ИСТОРИИ BUY-СИГНАЛОВ
+    if ai_signal == "BUY":
+        consecutive_buy_signals += 1
+        buy_signals_history.append(ai_confidence)
+        if len(buy_signals_history) > 5:
+            buy_signals_history.pop(0)
+    else:
+        consecutive_buy_signals = 0
+        buy_signals_history.clear()
+    
+    # 2. FORCED ENTRY: 3 BUY подряд + avg Conf ≥65%
+    if (consecutive_buy_signals >= 3 and 
+        len(buy_signals_history) >= 3 and
+        lots == 0):
+        
+        avg_conf = sum(buy_signals_history[-3:]) / 3
+        
+        if (avg_conf >= 65 and 
+            rsi < 75 and
+            bullish_prob > 0.55):
+            
+            metadata = {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
+    # 2b. НАКОПЛЕНИЕ ИСТОРИИ SELL-СИГНАЛОВ
+    if ai_signal == "SELL":
+        consecutive_sell_signals += 1
+        sell_signals_history.append(ai_confidence)
+        if len(sell_signals_history) > 5:
+            sell_signals_history.pop(0)
+    elif ai_signal != "BUY":  # Сброс только если не BUY (чтобы не сбрасывать при переключении BUY->SELL)
+        consecutive_sell_signals = 0
+        sell_signals_history.clear()
+
+    # 2c. FORCED ENTRY: 3 SELL подряд + avg Conf ≥65%
+    if (consecutive_sell_signals >= 3 and
+        len(sell_signals_history) >= 3 and
+        lots == 0):
+
+        avg_conf_sell = sum(sell_signals_history[-3:]) / 3
+
+        if (avg_conf_sell >= 65 and
+            rsi > 25 and
+            bearish_prob > 0.55):
+
+            metadata = {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
+            return "SELL1", f"🚨 FORCED ENTRY SHORT: 3 consecutive SELL (avg Conf {avg_conf_sell:.1f}%) | RSI {rsi:.1f}", metadata
+
+            return "BUY1", f"🚨 FORCED ENTRY: 3 consecutive BUY (avg Conf {avg_conf:.1f}%) | RSI {rsi:.1f}", metadata
+    
+    # 3. Dynamic Confidence Correction
     is_extreme = any(word in str(rules).lower() for word in ["vortex", "extreme", "arctic", "noaa"])
     effective_confidence = ai_confidence + (20 if is_extreme else 0)
-    
-    # Снижаем порог входа для "разведки" при экстремальных событиях
     min_entry_conf = 40 if is_extreme else 70
 
-    # 2. Обработка многовариантности (Bayesian Hedge)
-    # Если мы в медвежьем BIAS, но вероятность роста > 30% (ТЗ п.5.1)
+    # 4. Bayesian Hedge
     is_bullish_hedge_ready = (bias == "bearish" and bullish_prob > 0.30)
     is_bearish_hedge_ready = (bias == "bullish" and bearish_prob > 0.30)
 
-    # 3. ЛОГИКА ВХОДА (Если позиции нет)
+    # 5. ЛОГИКА ВХОДА
     if lots == 0:
-        # ТЕСТОВЫЙ ВХОД: HOLD + Conf >= 65 + Bullish >= 0.40 при импульсе
         market_state_u = str(market_state or "RANGE").upper().strip()
-        if (ai_signal == "HOLD" and ai_confidence >= 65 and bullish_prob >= 0.40 and 
+        if (ai_signal == "HOLD" and ai_confidence >= 65 and bullish_prob >= 0.40 and
             rsi <= 80 and market_state_u in ("IMPULSE_UP", "UP")):
-            return "BUY1", f"TEST ENTRY: HOLD+Conf {ai_confidence}% + Bull {bullish_prob:.2f} + RSI {rsi:.1f}"
-        # Сценарий LONG
+            return "BUY1", f"TEST ENTRY: HOLD+Conf {ai_confidence}% + Bull {bullish_prob:.2f} + RSI {rsi:.1f}", metadata
+        
         if ai_signal == "BUY":
             if effective_confidence >= min_entry_conf:
-                return "BUY1", f"Entry: Conf {effective_confidence}% | Bullish {bullish_prob:.2f}"
+                return "BUY1", f"Entry: Conf {effective_confidence}% | Bullish {bullish_prob:.2f}", metadata
             if is_bullish_hedge_ready and rsi < 40:
-                return "BUY1", f"Hedge Long: Prob {bullish_prob:.2f} вопреки Bias {bias}"
-        
-        # Сценарий SHORT
+                return "BUY1", f"Hedge Long: Prob {bullish_prob:.2f} вопреки Bias {bias}", metadata
+
         if ai_signal == "SELL":
             if effective_confidence >= min_entry_conf:
-                return "SELL1", f"Entry: Conf {effective_confidence}% | Bearish {bearish_prob:.2f}"
+                return "SELL1", f"Entry: Conf {effective_confidence}% | Bearish {bearish_prob:.2f}", metadata
             if is_bearish_hedge_ready and rsi > 60:
-                return "SELL1", f"Hedge Short: Prob {bearish_prob:.2f} вопреки Bias {bias}"
+                return "SELL1", f"Hedge Short: Prob {bearish_prob:.2f} вопреки Bias {bias}", metadata
 
-    # 4. ЛОГИКА УПРАВЛЕНИЯ (Если позиция есть)
+    # 6. ЛОГИКА УПРАВЛЕНИЯ
     else:
-        # Проверка на мгновенный разворот (Event-Driven Rebalancer)
-        if lots > 0: # Мы в лонге
+        if lots > 0:
             if bearish_prob > 0.65 or (ai_signal == "SELL" and effective_confidence > 80):
-                return "SELL_ALL", f"Emergency Rebalance: Bearish prob {bearish_prob:.2f}"
-            
-            # Частичная фиксация при ослаблении
+                return "SELL_ALL", f"Emergency Rebalance: Bearish prob {bearish_prob:.2f}", metadata
             if bullish_prob < 0.40 and rsi > 70:
-                return "SELL_HALF", "Partial TP: Bullish momentum weakening"
+                return "SELL_HALF", "Partial TP: Bullish momentum weakening", metadata
 
-        if lots < 0: # Мы в шорте
+        if lots < 0:
             if bullish_prob > 0.65 or (ai_signal == "BUY" and effective_confidence > 80):
-                return "BUY_ALL", f"Emergency Rebalance: Bullish prob {bullish_prob:.2f}"
-            
-            # Частичная фиксация при ослаблении
+                return "BUY_ALL", f"Emergency Rebalance: Bullish prob {bullish_prob:.2f}", metadata
             if bearish_prob < 0.40 and rsi < 30:
-                return "BUY_HALF", "Partial TP: Bearish momentum weakening"
+                return "BUY_HALF", "Partial TP: Bearish momentum weakening", metadata
 
-    # 5. Блокировка "зависания" (Static Bias Override)
-    # Если RSI экстремальный, а AI молчит - даем шанс на микро-вход
+    # 7. Static Bias Override
     if rsi < 20 and bias == "bearish" and bullish_prob > 0.25:
-        return "BUY1", "Extreme RSI mean reversion attempt (Hedge)"
+        return "BUY1", "Extreme RSI mean reversion attempt (Hedge)", metadata
 
-    return "NOOP", f"Waiting. B:{bullish_prob:.2f} S:{bearish_prob:.2f} RSI:{rsi:.1f}"
-
+    return "NOOP", f"Waiting. B:{bullish_prob:.2f} S:{bearish_prob:.2f} RSI:{rsi:.1f}", metadata
 
 
 
@@ -1338,15 +1397,23 @@ async def main_loop():
 
             rules = parse_trading_rules_from_news()
             current_bias = rules.get("bias", "neutral")
-
-            # 5. NEWS_AGENT анализирует новости + техничку
-            print("📰 NEWS_AGENT: Анализ новостей и фундамента...")
-            full_context = f"{weather_str}\nНОВОСТИ:\n{manual_news}"
-            news_result = await analyst.analyze(
-                marketdata=data,
-                newscontext=full_context,
-                bias=current_bias,
-            )
+            
+            # 5. NEWS_AGENT анализирует новости + техничку (кэш: обновление раз в 10 циклов)
+            global last_news_result, news_cache_cycle
+            
+            if cycle % 10 == 1 or last_news_result is None:
+                print("📰 NEWS_AGENT: Анализ новостей и фундамента (full refresh)...")
+                full_context = f"{weather_str}\nНОВОСТИ:\n{manual_news}"
+                news_result = await analyst.analyze(
+                    marketdata=data,
+                    newscontext=full_context,
+                    bias=current_bias,
+                )
+                last_news_result = news_result
+                news_cache_cycle = cycle
+            else:
+                print(f"📰 NEWS_AGENT: Используется кэш (цикл {news_cache_cycle}, след обновление через {10 - (cycle % 10)} циклов)...")
+                news_result = last_news_result
 
             print(f"🤖 AI: {news_result.signal} | Conf: {news_result.confidence}%")
             print(
@@ -1440,7 +1507,7 @@ async def main_loop():
 
 
             # 9. DECISION_BLOCK
-            action, action_reason = decide_action(
+            action, action_reason, decision_metadata = decide_action(
                 lots=current_lots,
                 max_lots=MAX_LOTS_ALLOWED,
                 ai_signal=news_result.signal,
@@ -1484,6 +1551,9 @@ async def main_loop():
                 rules=plan_result,
                 action=action,
                 reason=action_reason,
+                forced_entry=decision_metadata.get("forced_entry", False),
+                consecutive_signals=decision_metadata.get("consecutive_signals", 0),
+                avg_confidence=decision_metadata.get("avg_confidence", 0.0),
             )
 
             await asyncio.sleep(60)
