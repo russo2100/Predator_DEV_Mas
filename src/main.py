@@ -1149,7 +1149,8 @@ def decide_action(
     rsi: float,
     bias: str,
     rules: Dict[str, Any],
-    market_state: str = "RANGE"
+    market_state: str = "RANGE",
+    minutes_to_clearing: int = 999
 ) -> tuple[str, str, dict]:  # ← ИЗМЕНЕНО: добавлен dict с метаданными
     """
     v2.0 Hybrid Architecture Decision Engine.
@@ -1163,6 +1164,9 @@ def decide_action(
     
     # Дефолтные метаданные
     metadata = {"forced_entry": False, "consecutive_signals": 0, "avg_confidence": 0.0}
+        # ЗАЩИТА: блокировка FORCED ENTRY за 30 минут до клиринга
+    clearing_block = minutes_to_clearing <= 30
+
     
     # 0. ОБРАБОТКА ОШИБОК OPENROUTER
     if ai_signal == "NEUTRAL" and ai_confidence == 0:
@@ -1180,6 +1184,10 @@ def decide_action(
         buy_signals_history.clear()
     
     # 2. FORCED ENTRY: 3 BUY подряд + avg Conf ≥65%
+    if clearing_block:
+        return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min) - no forced entry", metadata
+
+    
     if (consecutive_buy_signals >= 3 and 
         len(buy_signals_history) >= 3 and
         lots == 0):
@@ -1477,6 +1485,8 @@ async def main_loop():
                 bearish_prob=news_result.bearish_prob,
                 rsi=rsi_val,
                 market_state=data.get("marketstate", "RANGE"),
+
+
                 risk_mode=sharedstate.risk_mode
 
             )
