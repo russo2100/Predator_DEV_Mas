@@ -788,6 +788,10 @@ class LLMMarketAnalystAdapter:
             }
 
 
+def escape_html(text: str) -> str:
+    """Экранирует HTML-символы для Telegram API."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 async def send_telegram(msg: str) -> None:
     """Отправляет уведомление в Telegram с защитой от ошибок."""
     try:
@@ -798,7 +802,7 @@ async def send_telegram(msg: str) -> None:
         async with aiohttp.ClientSession() as session:
             payload = {
                 "chat_id": chat_id,
-                "text": msg,
+                "text": escape_html(msg),
                 "parse_mode": "HTML",
                 "disable_web_page_preview": True
             }
@@ -1287,6 +1291,14 @@ def decide_action(
                 return "BUY_HALF", "Partial TP: Bearish momentum weakening", metadata
 
     # 7. Static Bias Override
+    # 6.5. EXTREME OVERSOLD: Агрессивный вход при RSI < 20 (NEUTRAL bias)
+    if rsi < 20 and lots == 0 and bullish_prob > 0.15:
+        return "BUY1", f"🚨 EXTREME OVERSOLD: RSI {rsi:.1f} < 20 | Bull {bullish_prob:.2f} | Mean reversion", metadata
+
+    # 6.6. EXTREME OVERBOUGHT: Агрессивный вход при RSI > 80 (NEUTRAL bias)
+    if rsi > 80 and lots == 0 and bearish_prob > 0.15:
+        return "SELL1", f"🚨 EXTREME OVERBOUGHT: RSI {rsi:.1f} > 80 | Bear {bearish_prob:.2f} | Mean reversion", metadata
+
     if rsi < 20 and bias == "bearish" and bullish_prob > 0.25:
         return "BUY1", "Extreme RSI mean reversion attempt (Hedge)", metadata
 
@@ -1297,9 +1309,6 @@ def decide_action(
 def _env_bool(name: str, default: str = "false") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-TRADE_ENABLED = _env_bool("TRADE_ENABLED", "false")
 
 
 async def post_order_guarded(
@@ -1319,11 +1328,6 @@ async def post_order_guarded(
         # Не шлем в ТГ каждый qty=0, чтобы не спамить, только в консоль
         return False
 
-    if not TRADE_ENABLED:
-        msg = f"🧪 <b>DRY-RUN (Симуляция):</b>\nДействие: {direction} {quantity} лотов\nЦель: {figi}\nОбоснование: {why}"
-        print(f"🧪 DRY-RUN: WOULD {direction} {quantity} {figi} | {why}")
-        await send_telegram(msg) # Уведомляем, что бот БЫ сделал в реале
-        return False
 
     try:
         # Пытаемся отправить реальный ордер
@@ -1402,6 +1406,12 @@ async def main_loop():
 
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
+
+            # Расчет PnL
+            if current_lots > 0 and avg_price > 0:
+                pnl_pct = ((current_price - avg_price) / avg_price) * 100
+            else:
+                pnl_pct = 0.0
             rsi_val = float(data.get("RSI", 50.0))
             trend_5m = data.get("trend", "FLAT")
             current_volume = int(candles["volume"].iloc[-1]) if not candles.empty and "volume" in candles.columns else 0
@@ -1470,6 +1480,12 @@ async def main_loop():
                 },
             )
             risk_allowed = bool(risk_verdict.get("allowed", False))
+            # === EXTREME OVERSOLD OVERRIDE ===
+            if not risk_allowed and rsi_val < 20 and news_result.bullish_prob > 0.20:
+                risk_allowed = True
+                print(f"✅ RISK OVERRIDE: EXTREME OVERSOLD RSI {rsi_val:.1f} < 20 | Bull {news_result.bullish_prob:.2f}")
+                risk_verdict["allowed"] = True
+                risk_verdict["reason"] = "EXTREME OVERSOLD override"
             print(
                 f"✓ Risk Verdict: {risk_verdict['reason']} | "
                 f"Risk Score: {risk_verdict['risk_score']}"
@@ -1489,12 +1505,29 @@ async def main_loop():
             # 8. Погода как фильтр
             weather_allowed = True
             block_reason = ""
+            # === SMART WEATHER OVERRIDE ===
+            weather_impact = weather_data.get("demand_impact_pct", 0)
+            arctic_score = weather_data.get("arctic_blast_score", 0.0)
+            
             if weather_data.get("is_extreme"):
-                print("⚠️ WEATHER_ALERT: Экстремальные условия!")
-                weather_allowed = False
-                block_reason = "WEATHER_ALERT: extreme conditions -> block entries"
-                risk_allowed = False
-
+                # Проверяем EXTREME OVERSOLD override
+                if rsi_val < 20 and news_result.bullish_prob > 0.20:
+                    if weather_impact < 90:
+                        # Обычный холод → full override
+                        weather_allowed = True
+                        print(f"✅ WEATHER OVERRIDE: RSI {rsi_val:.1f} < 20 > Weather (impact {weather_impact}%)")
+                    else:
+                        # Критический шторм → partial override (половина лота)
+                        weather_allowed = True
+                        MAX_LOTS_ALLOWED = max(1, MAX_LOTS_ALLOWED // 2)
+                        print(f"⚠️ PARTIAL OVERRIDE: RSI {rsi_val:.1f} < 20 + CRITICAL Weather ({weather_impact}%) → 0.5x lots")
+                else:
+                    # Блокируем вход
+                    weather_allowed = False
+                    block_reason = f"WEATHER_ALERT: extreme conditions (impact {weather_impact}%, arctic {arctic_score:.2f}) -> block entries"
+                    print(f"🌡️ Weather Impact: {weather_impact}% | Arctic Score: {arctic_score:.2f}")
+            else:
+                weather_allowed = True
             trade_allowed = risk_allowed and weather_allowed
 
             # === GWDD INTEGRATION: Gaussian Weight Distribution Dynamics ===
@@ -1530,11 +1563,19 @@ async def main_loop():
             sharedstate.gwdd_weight = entry_weight
             sharedstate.suggested_lots = position_size
             
-            # GWDD может перекрыть решение risk_agent
-            if not should_enter and news_result.signal in ["BUY", "SELL"]:
-                trade_allowed = False
-                block_reason = f"GWDD_BLOCK: {gwdd_reason}"
 
+            # GWDD может перекрыть решение risk_agent
+            # НО: EXTREME OVERSOLD override имеет приоритет
+            if not should_enter and news_result.signal in ["BUY", "SELL"]:
+                # Проверяем EXTREME OVERSOLD исключение
+                is_extreme_oversold = (rsi_val < 20 and news_result.bullish_prob > 0.20 and current_lots == 0)
+                is_extreme_overbought = (rsi_val > 80 and news_result.bearish_prob > 0.20 and current_lots == 0)
+                
+                if not (is_extreme_oversold or is_extreme_overbought):
+                    trade_allowed = False
+                    block_reason = f"GWDD_BLOCK: {gwdd_reason}"
+                else:
+                    print(f"⚡ GWDD OVERRIDE: EXTREME condition (RSI {rsi_val:.1f}) bypasses GWDD block")
 
             # 9. DECISION_BLOCK
             action, action_reason, decision_metadata = decide_action(
@@ -1598,6 +1639,7 @@ async def main_loop():
                 rules=plan_result,
                 action=action,
                 reason=action_reason,
+                pnl_pct=pnl_pct,
                 forced_entry=decision_metadata.get("forced_entry", False),
                 consecutive_signals=decision_metadata.get("consecutive_signals", 0),
                 avg_confidence=decision_metadata.get("avg_confidence", 0.0),
