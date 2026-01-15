@@ -5,7 +5,7 @@ import re
 import json
 import uuid
 import aiohttp
-from typing import Dict, Any, Literal, Optional
+from typing import Dict, Any, Literal, Optional, Tuple
 from datetime import datetime, timedelta, timezone, time
 
 from src.agents.analyst import MarketAnalyst
@@ -1086,6 +1086,8 @@ def log_decision_block(
     print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
     print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
 
+
+
     # ← НОВЫЙ ВЫВОД для форсированных входов
     if forced_entry:
         print(f"🚨 FORCED ENTRY: {consecutive_signals} consecutive BUY (avg Conf {avg_confidence:.1f}%)")
@@ -1164,9 +1166,12 @@ def decide_action(
     market_state: str = "RANGE",
     minutes_to_clearing: int = 999,
     current_volume: int = 0,
+    avg_volume: int = 1,
     atr: float = 0.1,
-    avg_volume: int = 1
-) -> tuple[str, str, dict]:  # ← ИЗМЕНЕНО: добавлен dict с метаданными
+    current_price: float = 0.0,   # NEW
+    sl_level: float = 0.0,        # NEW
+) -> Tuple[str, str, Dict[str, Any]]:
+  # ← ИЗМЕНЕНО: добавлен dict с метаданными
     """
     v2.0 Hybrid Architecture Decision Engine.
     Реализует Bayesian Scenario Engine и динамическую адаптивность.
@@ -1283,6 +1288,21 @@ def decide_action(
                 return "SELL1", f"Entry: Conf {effective_confidence}% | Bearish {bearish_prob:.2f}", metadata
             if is_bearish_hedge_ready and rsi > 60:
                 return "SELL1", f"Hedge Short: Prob {bearish_prob:.2f} вопреки Bias {bias}", metadata
+    
+    
+    # 5.5. ATR STOP: принудительное закрытие лонга/шорта
+    if sl_level is not None and current_price is not None:
+        # ЛОНГ: цена ушла ниже SL -> закрываем
+        if lots > 0 and current_price <= sl_level:
+            return "SELL_ALL", (
+                f"ATR SL hit: price {current_price:.3f} <= SL {sl_level:.3f}"
+            ), metadata
+
+        # ШОРТ: цена выше SL -> закрываем
+        if lots < 0 and current_price >= sl_level:
+            return "BUY_ALL", (
+                f"ATR SL hit (short): price {current_price:.3f} >= SL {sl_level:.3f}"
+            ), metadata
 
     # 6.x. EXTREME OVERSOLD: блокируем Emergency Rebalance SELL_ALL
     if rsi < 20 and lots > 0 and ai_signal == "SELL":
@@ -1360,6 +1380,17 @@ async def post_order_guarded(
 
 
 async def main_loop():
+    
+    from src.services.atr_stop import ATRStopEngine
+    from src.shared_state import SharedTradingState
+    
+    sharedstate = SharedTradingState()
+    atr_stop = ATRStopEngine(k_sl=1.5, m_be=1.0)
+
+    prev_lots = 0
+
+
+    
     # Теперь это сработает для всех ключей
     token = settings.TINKOFF_TOKEN.get_secret_value()
 
@@ -1382,6 +1413,7 @@ async def main_loop():
     news_agent = UnifiedNewsAgent()
     weather_monitor = SynopticMonitor()
     sharedstate = SharedTradingState()
+    atr_stop = ATRStopEngine(k_sl=1.5, m_be=1.0)
 
     print("👻 Hybrid Architecture v2.0: Режим активного мониторинга запущен.")
     await send_telegram("🚀 Predator v2.0: Bayesian Engine + Synoptic Monitor активны.")
@@ -1389,6 +1421,7 @@ async def main_loop():
     cycle = 0
     position_timer = PositionTimer()
     MAX_LOTS_ALLOWED = 8
+    prev_lots = 0
 
     while True:
         try:
@@ -1406,6 +1439,34 @@ async def main_loop():
             pos = await get_position_data_safe(executor, FIGI_NRF6, retries=3)
             current_lots = int(pos["lots"])
             avg_price = float(pos["average_price"])
+            
+            # === ATR STOP: OPEN/CLOSE DETECTION ===
+            if prev_lots == 0 and current_lots > 0:
+                # Открылась новая позиция
+                direction = "LONG"  # для NRF6, если когда-то будет SHORT — определим по знаку или отдельному флагу
+                atr_0 = float(data.get("ATR", 0.1)) if 'data' in locals() else 0.1  # на первом проходе data ещё нет
+
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0)
+
+                # Синхронизируем с shared state
+                sharedstate.entry_price = avg_price
+                sharedstate.atr_at_entry = atr_0
+                sharedstate.position_direction = direction
+                sharedstate.sl_level = atr_stop.get_sl() or 0.0
+                sharedstate.p_high_since_entry = avg_price
+                sharedstate.p_low_since_entry = avg_price
+
+            elif prev_lots > 0 and current_lots == 0:
+                # Позиция полностью закрыта
+                atr_stop.on_close()
+                sharedstate.sl_level = 0.0
+                sharedstate.atr_at_entry = 0.0
+                sharedstate.position_direction = ""
+                sharedstate.p_high_since_entry = 0.0
+                sharedstate.p_low_since_entry = 0.0
+
+            prev_lots = current_lots
+
 
             # 2. Получение и анализ свечей
             candles = await executor.get_candles(FIGI_NRF6)
@@ -1416,6 +1477,42 @@ async def main_loop():
 
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
+            
+            atr_t = float(data.get("ATR", 0.1))
+
+            # ATR STOP: открытие / закрытие
+            if prev_lots == 0 and current_lots > 0:
+                direction = "LONG"  # позже можно расширить до LONG/SHORT
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t)
+
+                st = atr_stop.get_state()
+                if st is not None:
+                    sharedstate.entry_price = st.entry_price
+                    sharedstate.atr_at_entry = st.atr_at_entry
+                    sharedstate.position_direction = st.direction
+                    sharedstate.sl_level = st.sl_level
+                    sharedstate.p_high_since_entry = st.p_high_since_entry
+                    sharedstate.p_low_since_entry = st.p_low_since_entry
+
+            elif prev_lots > 0 and current_lots == 0:
+                atr_stop.on_close()
+                sharedstate.sl_level = 0.0
+                sharedstate.atr_at_entry = 0.0
+                sharedstate.position_direction = ""
+                sharedstate.p_high_since_entry = 0.0
+                sharedstate.p_low_since_entry = 0.0
+
+            prev_lots = current_lots
+
+            # Если позиция уже открыта — просто подтягиваем стоп
+            if current_lots > 0:
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t)
+                st = atr_stop.get_state()
+                if st is not None:
+                    sharedstate.sl_level = st.sl_level
+                    sharedstate.p_high_since_entry = st.p_high_since_entry
+                    sharedstate.p_low_since_entry = st.p_low_since_entry
+
 
             # Расчет PnL
             if current_lots > 0 and avg_price > 0:
@@ -1426,6 +1523,65 @@ async def main_loop():
             trend_5m = data.get("trend", "FLAT")
             current_volume = int(candles["volume"].iloc[-1]) if not candles.empty and "volume" in candles.columns else 0
             avg_volume_20 = int(candles["volume"].tail(20).mean()) if len(candles) >= 20 and "volume" in candles.columns else 1
+            
+            
+            atr_t = float(data.get("ATR", 0.1))
+
+            # === ATR STOP: OPEN/CLOSE & UPDATE ===
+            # Открытие новой позиции
+            if prev_lots == 0 and current_lots > 0:
+                # TODO: когда появятся реальные шорты — добавить определение направления
+                direction = "LONG" if current_lots > 0 else "SHORT"
+
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t)
+                st = atr_stop.get_state()
+                if st is not None:
+                    sharedstate.entry_price = st.entry_price
+                    sharedstate.atr_at_entry = st.atr_at_entry
+                    sharedstate.position_direction = st.direction
+                    sharedstate.sl_level = st.sl_level
+                    sharedstate.p_high_since_entry = st.p_high_since_entry
+                    sharedstate.p_low_since_entry = st.p_low_since_entry
+
+            # Полное закрытие позиции
+            elif prev_lots > 0 and current_lots == 0:
+                atr_stop.on_close()
+                sharedstate.sl_level = 0.0
+                sharedstate.atr_at_entry = 0.0
+                sharedstate.position_direction = ""
+                sharedstate.p_high_since_entry = 0.0
+                sharedstate.p_low_since_entry = 0.0
+
+            prev_lots = current_lots
+
+            # Обновление стопа, если позиция открыта
+            if current_lots > 0:
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t)
+                st = atr_stop.get_state()
+                if st is not None:
+                    sharedstate.sl_level = st.sl_level
+                    sharedstate.p_high_since_entry = st.p_high_since_entry
+                    sharedstate.p_low_since_entry = st.p_low_since_entry
+
+            
+            # === ATR STOP: UPDATE SL ===
+            if current_lots > 0:
+                atr_t = float(data.get("ATR", 0.1))
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t)
+
+                st = atr_stop.get_state()
+                if st is not None:
+                    sharedstate.sl_level = st.sl_level
+                    sharedstate.atr_at_entry = st.atr_at_entry
+                    sharedstate.p_high_since_entry = st.p_high_since_entry
+                    sharedstate.p_low_since_entry = st.p_low_since_entry
+                    sharedstate.position_direction = st.direction
+                    
+            print(
+                f"💰 Price: {current_price:.3f} | RSI: {rsi_val:.1f} | "
+                f"Lots: {current_lots} | PnL: {pnl_pct:.2f}% | SL: {sharedstate.sl_level:.3f}"
+            )
+
 
 
             # 3. Синоптический мониторинг (погода)
@@ -1603,22 +1759,11 @@ async def main_loop():
                 minutes_to_clearing=get_minutes_to_clearing(),
                 current_volume=current_volume,
                 avg_volume=avg_volume_20,
-                atr=data.get("ATR", 0.1)
+                atr=data.get("ATR", 0.1),
+                current_price=current_price,
+                sl_level=sharedstate.sl_level,
             )
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+            
             if trade_allowed and action != "NOOP":
                 direction = "BUY" if action.startswith("BUY") else "SELL"
                 qty = 1
