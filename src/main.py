@@ -7,7 +7,7 @@ import uuid
 import aiohttp
 from typing import Dict, Any, Literal, Optional, Tuple
 from datetime import datetime, timedelta, timezone, time
-
+from src.core.gwdd_engine import GWDDEngine, GWDDConfig
 from src.agents.analyst import MarketAnalyst
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -1400,12 +1400,17 @@ async def main_loop():
     # === GWDD ENGINE INITIALIZATION ===
     gwdd_config = GWDDConfig(
         sigma_confidence=15.0,
-        sigma_rsi=12.0,
-        sigma_prob=0.20,
-        global_min_weight=0.50,          # GWDD < 0.5 = почти всегда SKIP
-        min_weight_conservative=0.65,    # CONSERVATIVE
-        min_weight_moderate=0.55,        # MODERATE
-        min_weight_aggressive=0.45,      # AGGRESSIVE
+        sigma_rsi=10.0,
+        sigma_prob=0.15,
+        global_min_weight=0.50,
+        min_weight_conservative=0.65,
+        min_weight_moderate=0.55,
+        min_weight_aggressive=0.45,
+        risk_mode_adjustments={
+            "CONSERVATIVE": 0.5,
+            "MODERATE": 1.0,
+            "AGGRESSIVE": 1.5
+        }
     )
     gwdd_engine = GWDDEngine(gwdd_config)
     risk_agent = RiskAgent()
@@ -1696,32 +1701,43 @@ async def main_loop():
                 weather_allowed = True
             trade_allowed = risk_allowed and weather_allowed
 
-            # === GWDD INTEGRATION: Gaussian Weight Distribution Dynamics ===
-            print("📊 GWDD: Расчет веса входа...")
-            
-            entry_weight, gwdd_breakdown = gwdd_engine.calculate_entry_weight(
-                ai_signal=news_result.signal,
-                confidence=news_result.confidence,
-                bullish_prob=news_result.bullish_prob,
-                bearish_prob=news_result.bearish_prob,
-                rsi=rsi_val,
-                market_state=data.get("marketstate", "RANGE"),
-                risk_mode=sharedstate.risk_mode
+            position_size = 0
 
-            )
+            try:
+                print("📊 GWDD: Расчет веса входа...")
+                entry_weight, gwdd_breakdown = await gwdd_engine.calculate_entry_weight(
+                    ai_signal=news_result.signal,
+                    confidence=news_result.confidence,
+                    bullish_prob=news_result.bullish_prob,
+                    bearish_prob=news_result.bearish_prob,
+                    rsi=rsi_val,
+                    market_state=data.get("market_state", "RANGE"),
+                    risk_mode=risk_agent.get_risk_mode(),
+                    news_text=full_context,
+                )
+
+                should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
+                    entry_weight=entry_weight,
+                    risk_mode=risk_agent.get_risk_mode(),
+                    ai_signal=news_result.signal,
+                    rsi=rsi_val,
+                )
+
+                position_size = gwdd_engine.get_position_sizing(
+                    entry_weight=entry_weight,
+                    max_lots=MAX_LOTS_ALLOWED,
+                    risk_mode=risk_agent.get_risk_mode(),
+                    rsi=rsi_val,
+                )
+
+                
+
+            except Exception as e:
+                print(f"⚠️ GWDD ERROR: {e}")
+                entry_weight = 0.5
+                position_size = 0
+
             
-            should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
-                entry_weight=entry_weight,
-                risk_mode=sharedstate.risk_mode,
-                ai_signal=news_result.signal
-            )
-            
-            position_size = gwdd_engine.get_position_sizing(
-                entry_weight=entry_weight,
-                max_lots=MAX_LOTS_ALLOWED,
-                risk_mode=sharedstate.risk_mode,
-                rsi=rsi_val,
-            )            
             print(f"⚖️ GWDD Weight: {entry_weight:.3f} | Lots: {position_size}")
             print(f"   {gwdd_reason}")
             

@@ -3,6 +3,9 @@ from typing import Any, Dict
 
 
 class RiskAgent:
+    def get_risk_mode(self) -> str:
+        """Return current risk mode for GWDD engine integration."""
+        return "MODERATE"
     """
     Shadow Agent: Risk Management.
     Оценивает риски для каждого сигнала (alpha_signal).
