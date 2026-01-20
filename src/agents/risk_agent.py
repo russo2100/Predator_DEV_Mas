@@ -13,7 +13,7 @@ class RiskAgent:
 
     def __init__(self) -> None:
         # === ИЗМЕНЕНО: RSI пороги снижены для Range Trading ===
-        self.RSI_OVERBOUGHT: float = 65.0  # Было 70.0 → снижено до 65
+        self.RSI_OVERBOUGHT: float = 90.0  # Было 70.0 → снижено до 65
         self.RSI_OVERSOLD: float = 35.0    # Было 30.0 → повышено до 35
         # ========================================================
 

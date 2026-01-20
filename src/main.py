@@ -727,14 +727,14 @@ class LLMMarketAnalystAdapter:
     "ТВОЯ ТОРГОВАЯ СТРАТЕГИЯ:\n"
     "---------------------------------------------------\n"
     "СЦЕНАРИЙ 1: ФУНДАМЕНТАЛ = BULLISH (Рост)\n"
-    " - Игнорируй SELL, если RSI не >85.\n"
-    " - АТАКУЙ (BUY): RSI <45 (откат=возможность).\n"
-    " - STRONG BUY: RSI <35.\n"
+    " - Игнорируй SELL, если RSI не >95.\n"
+    " - АТАКУЙ (BUY): RSI <65 (тренд=сила).\n"
+    " - STRONG BUY: RSI 50-70 + UPTREND.\n"
     "---------------------------------------------------\n"
     "СЦЕНАРИЙ 2: ФУНДАМЕНТАЛ = BEARISH (Падение)\n"
-    " - Игнорируй BUY, если RSI не <15.\n"
-    " - АТАКУЙ (SELL): RSI >55 (отскок=шорт).\n"
-    " - STRONG SELL: RSI >65.\n"
+    " - Игнорируй BUY, если RSI не <5.\n"
+    " - АТАКУЙ (SELL): RSI >25 (тренд вниз=сила).\n"
+    " - STRONG SELL: RSI 35-50.\n"
     "---------------------------------------------------\n"
     "СЦЕНАРИЙ 3: ФУНДАМЕНТАЛ = NEUTRAL (Боковик)\n"
     " - BUY: RSI <30.\n"
@@ -1404,7 +1404,7 @@ async def main_loop():
         sigma_prob=0.15,
         global_min_weight=0.50,
         min_weight_conservative=0.65,
-        min_weight_moderate=0.55,
+        min_weight_moderate=0.50,
         min_weight_aggressive=0.45,
         risk_mode_adjustments={
             "CONSERVATIVE": 0.5,
@@ -1662,12 +1662,35 @@ async def main_loop():
                 f"Risk Score: {risk_verdict['risk_score']}"
             )
 
-            # 7. PLANNER синтезирует стратегию
-            print("🧠 PLANNER: Синтез торговой стратегии...")
+            # --- PLANNER CONTEXT SAFE DEFAULTS ---
+            trend_h1 = trend_5m
+            trend_d1 = trend_5m
+
             market_context = {
                 "ticker": "NG",
-                "trend_d1": trend_5m,
-                "trend_h1": trend_5m,
+                "trend_5m": trend_5m,
+                "trend_h1": locals().get("trend_h1", trend_5m),
+                "trend_d1": locals().get("trend_d1", trend_5m),
+                "market_state": data.get("market_state", data.get("marketstate","RANGE")),
+                "news_summary": manual_news[:500],
+            }
+
+            print("🧠 PLANNER: Синтез торговой стратегии...")
+            # --- PLANNER CONTEXT SAFE DEFAULTS ---
+            trend_h1 = trend_5m
+            trend_d1 = trend_5m
+
+            market_context = {
+                "ticker": "NG",
+
+                # как было: ты ошибочно писал trend_d1/h1 = trend_5m
+                "trend_5m": trend_5m,
+                "trend_h1": locals().get("trend_h1", trend_5m),
+                "trend_d1": locals().get("trend_d1", trend_5m),
+
+                # критично для override на импульсе/режиме рынка
+                "market_state": data.get("market_state", data.get("marketstate","RANGE")),   # или data.get("marketstate")
+
                 "news_summary": manual_news[:500],
             }
             plan_result = planner.create_plan(market_context)

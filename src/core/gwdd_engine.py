@@ -40,8 +40,8 @@ class GWDDConfig:
     global_min_weight: float = 0.50
     
     # Base thresholds for entry
-    min_weight_conservative: float = 0.65
-    min_weight_moderate: float = 0.55
+    min_weight_conservative: float = 0.60
+    min_weight_moderate: float = 0.50
     min_weight_aggressive: float = 0.45
     
     # Mode-specific entry thresholds
@@ -308,10 +308,10 @@ class GWDDEngine:
         
         # MODERATE mode RSI check (unchanged)
         if mode == "MODERATE" and rsi is not None:
-            if self.config.global_min_weight <= entry_weight < min_weight and rsi >= 70:
+            if self.config.global_min_weight <= entry_weight < min_weight and rsi >= 90:
                 return False, float(entry_weight), (
                     f"SKIP: MODERATE scout blocked by RSI={rsi:.1f} "
-                    f">= 70 at weight={entry_weight:.2f}"
+                    f">= 90 at weight={entry_weight:.2f}"
                 )
         
         # Final decision (unchanged)
@@ -346,13 +346,13 @@ class GWDDEngine:
         if entry_weight < self.config.global_min_weight:
             return 0
             
-        lots = 0
+        lots = max(1, int(max_lots * 0.25))
         mode = risk_mode or "MODERATE".upper()
         
         # CONSERVATIVE mode
         if mode == "CONSERVATIVE":
             if entry_weight < self.config.min_weight_conservative:
-                lots = 0
+                lots = max(1, int(max_lots * 0.25))
             elif entry_weight >= 0.80:
                 lots = 1
             else:
@@ -361,7 +361,7 @@ class GWDDEngine:
         # AGGRESSIVE mode
         elif mode == "AGGRESSIVE":
             if entry_weight < self.config.min_weight_aggressive:
-                lots = 0
+                lots = max(1, int(max_lots * 0.25))
             elif entry_weight >= 0.60:
                 lots = min(2, max_lots)
             else:
@@ -370,11 +370,11 @@ class GWDDEngine:
         # MODERATE mode (unchanged)
         else:  # MODERATE
             if entry_weight < self.config.min_weight_moderate:
-                lots = 0
+                lots = max(1, int(max_lots * 0.25))
             elif entry_weight >= 0.70:
-                # RSI >= 70 blocks position sizing
-                if rsi is not None and rsi >= 70:
-                    lots = 0
+                # RSI >= 85: only scout position
+                if rsi is not None and rsi >= 85:
+                    lots = max(1, int(max_lots * 0.25))
                 else:
                     lots = min(3, max_lots)
             else:
