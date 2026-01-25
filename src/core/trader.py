@@ -5,7 +5,7 @@ from t_tech.invest import AsyncClient, OrderDirection, OrderType
 from src.config.settings import settings
 
 
-class OrderExecutor:
+class MainOrderExecutor:
     def __init__(self, token: str):
         self.token = token
         self.account_id = None

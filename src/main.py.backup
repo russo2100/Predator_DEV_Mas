@@ -1,16 +1,12 @@
 import asyncio
 import pandas as pd
 import numpy as np
-import json
-import uuid
-from src.utils.jsonl_enrichment import enrich_cycle_event
 import re
 import json
 import uuid
 import aiohttp
 from typing import Dict, Any, Literal, Optional, Tuple
 from datetime import datetime, timedelta, timezone, time
-import time as time_module
 from src.core.gwdd_engine import GWDDEngine, GWDDConfig
 from src.agents.analyst import MarketAnalyst
 from src.config.settings import settings
@@ -18,6 +14,7 @@ from src.core.pipeline import pipeline_analysis
 from t_tech.invest import AsyncClient, OrderDirection, OrderType, CandleInterval, Future
 from pathlib import Path
 import os
+import time
 from src.core.multi_agent_adapter import MultiAgentShadowAdapter
 from src.agents.planner import PlannerAgent
 from src.agents.risk_agent import RiskAgent
@@ -87,27 +84,20 @@ def select_active_ng_contract(contracts: List[NGContract]) -> Optional[NGContrac
 
 
 def get_market_status():
-    moscow_tz = pytz.timezone("Europe/Moscow")
+    moscow_tz = pytz.timezone('Europe/Moscow')
     now = dt.datetime.now(moscow_tz)
     current_time = now.time()
-    weekday = now.weekday()  # 0=Mon, 6=Sun, 5=Sat
-    
-    # Воскресенье - закрыто
-    #if weekday == 6:
-    #    return False, "Воскресенье: рынок закрыт"
-    
-    # Суббота: торги 09:50 - 23:50 (на час позже)
-    if weekday == 5:
-        start_trade = dt.time(9, 50)
-        end_trade = dt.time(23, 50)
-        if not (start_trade <= current_time <= end_trade):
-            return False, f"Суббота: торги 09:50 - 23:50 MSK"
-    else:
-        # Пн-Пт: торги 08:50 - 23:50
-        start_trade = dt.time(8, 50)
-        end_trade = dt.time(23, 50)
-        if not (start_trade <= current_time <= end_trade):
-            return False, f"Вне времени торгов (08:50 - 23:50)"
+    weekday = now.weekday() # 0=Mon, 6=Sun
+
+    # 1. Воскресенье - выходной
+    if weekday == 6:
+        return False, "ВОСКРЕСЕНЬЕ: ВЫХОДНОЙ"
+
+    # 2. Рабочее окно Пн-Сб: 08:50 - 23:50
+    start_trade = dt.time(8, 50)
+    end_trade = dt.time(23, 50)
+    if not (start_trade <= current_time <= end_trade):
+        return False, f"ВНЕ РАБОЧЕГО ВРЕМЕНИ (Рынок откроется в 08:50)"
 
     # 3. Клиринги (МСК)
     # Дневной: 14:00-14:05 | Вечерний: 18:50-19:05
@@ -152,7 +142,7 @@ ACTIVE_UID = ACTIVE_NG_CONTRACT.uid
 print(f"✅ Active contract: {ACTIVE_TICKER} | FIGI: {ACTIVE_FIGI} | Expiry: {ACTIVE_NG_CONTRACT.expiry.strftime('%Y-%m-%d')}")
 # ========== END ACTIVE CONTRACT ==========
 
-NEWSFILE = "news_fire.txt"
+NEWS_FILE = "news.txt"
 
 # Максимальный размер позиции в лотах (только LONG)
 MAX_LOTS = 3
@@ -176,9 +166,6 @@ last_news_result = None      # Кэш результата NEWS_AGENT
 news_cache_cycle = 0         # Номер цикла последнего обновления
 last_sleep_log_time: Optional[dt.datetime] = None
 
-# ========== SESSION ID & JSONL ==========
-session_id = str(uuid.uuid4())[:8]
-jsonl_path = f"shadow_agents_log_{dt.datetime.now().strftime('%Y%m%d')}.jsonl"
 
 
 async def runshadowanalysisnonblocking(shadowadapter, marketdata, posdata, bias, signal, confidence, reason):
@@ -279,27 +266,19 @@ class TrailingStopManager:
         entry_price: float,
         atr: float,
         trend: str = "FLAT",
-        atr_multiplier_uptrend: float = 2.0,   # ← УВЕЛИЧЕНО (было 1.2)
-        atr_multiplier_other: float = 1.5,     # ← УВЕЛИЧЕНО (было 0.8)
+        atr_multiplier_uptrend: float = 1.2,
+        atr_multiplier_other: float = 0.8,
     ):
         self.entry_price = entry_price
         self.atr = atr
         self.trend = trend
         self.max_price = entry_price
-        print(f"🔧 DEBUG ATR: atr={atr:.4f}, trend={trend}, multiplier={atr_multiplier_uptrend if trend == 'UPTREND' else atr_multiplier_other}")
-
 
         # Вычисляем offset СНАЧАЛА
         if trend == "UPTREND":
             self.offset = atr * atr_multiplier_uptrend
         else:
             self.offset = atr * atr_multiplier_other
-            
-        # ЗАЩИТА: минимальный offset = 1% от entry_price (для NG)
-        min_offset = entry_price * 0.01  # 1%
-        if self.offset < min_offset:
-            print(f"⚠️ ATR offset слишком мал ({self.offset:.4f}), установлен минимум {min_offset:.4f}")
-            self.offset = min_offset
 
         # ТЕПЕРЬ можем использовать self.offset
         self.trailing_stop = entry_price - self.offset  # ← ПЕРЕМЕСТИТЬ СЮДА!
@@ -373,93 +352,56 @@ class TrailingStopManager:
         )
 
 class TrailingStopManagerShort:
-    def __init__(
-        self,
-        entryprice: float,
-        atr: float,
-        trend: str = "FLAT",
-        atrmultiplierdowntrend: float = 2.0,  # ← УВЕЛИЧЕНО
-        atrmultiplierother: float = 1.5,       # ← УВЕЛИЧЕНО
-    ):
+    def __init__(self, entryprice: float, atr: float, trend: str = "FLAT",
+                 atrmultiplierdowntrend: float = 1.2, atrmultiplierother: float = 0.8):
         self.entryprice = entryprice
         self.atr = atr
         self.trend = trend
         self.minprice = entryprice
-        
-        # DEBUG: Вывод ATR параметров (ИСПРАВЛЕНО)
-        print(
-            f"🔧 DEBUG ATR SHORT: atr={atr:.4f}, trend={trend}, "
-            f"multiplier={atrmultiplierdowntrend if trend == 'DOWNTREND' else atrmultiplierother}"
-        )
 
-        # Для шорта логично "шире" стоп при DOWNTREND
+        # Для шорта логично “шире” стоп при DOWNTREND (зеркально UPTREND у лонга)
         if trend == "DOWNTREND":
             self.offset = atr * atrmultiplierdowntrend
         else:
             self.offset = atr * atrmultiplierother
-        
-        # ЗАЩИТА: минимальный offset = 1% от entry_price
-        min_offset = entryprice * 0.01  # 1%
-        if self.offset < min_offset:
-            print(f"⚠️ ATR offset слишком мал ({self.offset:.4f}), установлен минимум {min_offset:.4f}")
-            self.offset = min_offset
 
-        # Trailing stop ВЫШЕ entry для SHORT
         self.trailingstop = entryprice + self.offset
-        
         self.entrytime = dt.datetime.now(dt.timezone.utc)
         self.minholdminutes = 5
-        
-        print(
-            f"🎯 Trailing Stop SHORT инициализирован: entry={entryprice:.4f}, "
-            f"offset={self.offset:.4f} ({trend}), SL={self.trailingstop:.4f}"
-        )
+        print(f"Trailing Stop SHORT entry={entryprice:.4f}, offset={self.offset:.4f} trend={trend}")
 
     def update(self, currentprice: float, trend: str) -> bool:
-        # Обновление режима/offset (ИСПРАВЛЕНО: 2.0 и 1.5)
+        # обновление режима/offset (по аналогии с лонгом)
         if trend != self.trend:
             self.trend = trend
             if trend == "DOWNTREND":
-                newoffset = self.atr * 2.0  # ← ИСПРАВЛЕНО (было 1.2)
+                newoffset = self.atr * 1.2
             else:
-                newoffset = self.atr * 1.5  # ← ИСПРАВЛЕНО (было 0.8)
-            
+                newoffset = self.atr * 0.8
             if newoffset > self.offset:
                 self.offset = newoffset
                 self.trailingstop = self.minprice + self.offset
 
-        # Если цена ушла ниже — для шорта это прибыль → двигаем minprice вниз
+        # если цена ушла ниже — для шорта это прибыль → двигаем minprice вниз
         if currentprice < self.minprice:
             self.minprice = currentprice
             newstop = self.minprice + self.offset
-            
             if newstop < self.trailingstop:
                 old = self.trailingstop
                 self.trailingstop = newstop
                 profitpct = (self.entryprice - self.minprice) / self.entryprice * 100
-                print(
-                    f"🔽 Trailing Stop SHORT снижен: {old:.4f} → {self.trailingstop:.4f} "
-                    f"(min={self.minprice:.4f}, profit={profitpct:+.2f}%)"
-                )
+                print(f"Trailing Stop SHORT moved {old:.4f}->{self.trailingstop:.4f} min={self.minprice:.4f} profit={profitpct:.2f}%")
 
-        # ЗАЩИТА: проверяем trailing только если прибыль >= 0.5%
         profitpct_now = (self.entryprice - currentprice) / self.entryprice * 100
-        
         if profitpct_now < 0.5:
-            return False  # Не выходим до +0.5%
+            return False
 
-        # Стоп для шорта срабатывает если цена поднялась выше stop
+        # стоп для шорта срабатывает если цена поднялась выше stop
         if currentprice >= self.trailingstop:
             profitfinal = (self.entryprice - currentprice) / self.entryprice * 100
-            print(
-                f"🚨 TRAILING STOP SHORT СРАБОТАЛ! "
-                f"Цена {currentprice:.4f} >= стоп {self.trailingstop:.4f} "
-                f"(profit={profitfinal:+.2f}%)"
-            )
+            print(f"TRAILING STOP SHORT! price={currentprice:.4f} stop={self.trailingstop:.4f} profit={profitfinal:.2f}%")
             return True
-        
         return False
-
 
 
 def get_minutes_to_clearing() -> int:
@@ -646,7 +588,7 @@ def check_intraday_profit_take(
     return True
 
 
-class MainOrderExecutor:
+class OrderExecutor:
     def __init__(self, token: str):
         self.token = token
         self.account_id: Optional[str] = None
@@ -684,137 +626,35 @@ class MainOrderExecutor:
         except Exception as e:
             print(f"⚠️ ОШИБКА СЕТИ при получении позиции: {e}")
             return None  # Возвращаем None, чтобы главный цикл знал о сбое
-    
-    
-    async def get_portfolio(self) -> Dict[str, Any]:
-        """
-        Получает snapshot портфеля (позиции, баланс, портфельная стоимость).
-        Возвращает dict с positions, total_amount_currencies, total_amount_portfolio.
-        """
+
+    async def get_candles(self, figi: str) -> pd.DataFrame:
+        """Загрузка реальных H1‑свечей за 7 дней по FIGI."""
+        now = dt.datetime.now(dt.timezone.utc)
         try:
             async with AsyncClient(self.token) as client:
-                account_id = await self._get_account_id(client)
-                portfolio = await client.operations.get_portfolio(account_id=account_id)
-                
-                return {
-                    "total_amount_currencies": (
-                        portfolio.total_amount_currencies.units 
-                        + portfolio.total_amount_currencies.nano / 1e9
-                    ),
-                    "total_amount_portfolio": (
-                        portfolio.total_amount_portfolio.units 
-                        + portfolio.total_amount_portfolio.nano / 1e9
-                    ),
-                    "positions": [
+                candles = []
+                async for c in client.get_all_candles(
+                    figi=figi,
+                    from_=now - timedelta(days=7),
+                    interval=CandleInterval.CANDLE_INTERVAL_HOUR,
+                ):
+                    candles.append(
                         {
-                            "figi": p.figi,
-                            "instrument_type": p.instrument_type,
-                            "name": getattr(p, "instrument_name", ""),
-                            "ticker": getattr(p, "ticker", ""),
-                            "balance": p.quantity.units + p.quantity.nano / 1e9,
-                            "average_position_price_value": (
-                                p.average_position_price.units 
-                                + p.average_position_price.nano / 1e9
-                            ) if p.average_position_price else None,
-                            "current_price_value": (
-                                p.current_price.units 
-                                + p.current_price.nano / 1e9
-                            ),
-                            "expected_yield_value": (
-                                p.expected_yield.units 
-                                + p.expected_yield.nano / 1e9
-                            ),
-                            "blocked": (
-                                p.blocked.units 
-                                + p.blocked.nano / 1e9
-                            ) if p.blocked else 0.0
+                            "time": c.time,
+                            "open": c.open.units + c.open.nano / 1e9,
+                            "high": c.high.units + c.high.nano / 1e9,
+                            "low": c.low.units + c.low.nano / 1e9,
+                            "close": c.close.units + c.close.nano / 1e9,
+                            "volume": c.volume,
                         }
-                        for p in portfolio.positions
-                    ]
-                }
+                    )
+                df = pd.DataFrame(candles)
+                if not df.empty:
+                    df.set_index("time", inplace=True)
+                return df
         except Exception as e:
-            print(f"⚠️ get_portfolio error: {e}")
-            return {
-                "positions": [], 
-                "total_amount_currencies": 0.0, 
-                "total_amount_portfolio": 0.0
-            }
-
-    async def get_operations(self, from_date: datetime, to_date: datetime, figi: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Получает список операций (сделки, вариационная маржа, комиссии) за период.
-        
-        Args:
-            from_date: начало периода (datetime с timezone)
-            to_date: конец периода (datetime с timezone)
-            figi: фильтр по инструменту (опционально)
-        
-        Returns:
-            Список dict с данными операций
-        """
-        try:
-            async with AsyncClient(self.token) as client:
-                account_id = await self._get_account_id(client)
-                response = await client.operations.get_operations(
-                    account_id=account_id,
-                    from_=from_date,
-                    to=to_date,
-                    figi=figi
-                )
-                
-                return [
-                    {
-                        "id": op.id,
-                        "order_id": getattr(op, "order_id", ""),
-                        "operation_type": op.operation_type.name if hasattr(op.operation_type, "name") else str(op.operation_type),
-                        "date": op.date,
-                        "payment_value": op.payment.units + op.payment.nano / 1e9,
-                        "commission_value": (
-                            op.commission.units + op.commission.nano / 1e9
-                        ) if op.commission else 0.0,
-                        "quantity": op.quantity,
-                        "price_value": (
-                            op.price.units + op.price.nano / 1e9
-                        ) if op.price else 0.0,
-                        "figi": op.figi,
-                        "instrument_name": getattr(op, "instrument_name", ""),
-                        "ticker": getattr(op, "ticker", "")
-                    }
-                    for op in response.operations
-                ]
-        except Exception as e:
-            print(f"⚠️ get_operations error: {e}")
-            return []
-
-
-        async def get_candles(self, figi: str) -> pd.DataFrame:
-            """Загрузка реальных H1‑свечей за 7 дней по FIGI."""
-            now = dt.datetime.now(dt.timezone.utc)
-            try:
-                async with AsyncClient(self.token) as client:
-                    candles = []
-                    async for c in client.get_all_candles(
-                        figi=figi,
-                        from_=now - timedelta(days=7),
-                        interval=CandleInterval.CANDLE_INTERVAL_HOUR,
-                    ):
-                        candles.append(
-                            {
-                                "time": c.time,
-                                "open": c.open.units + c.open.nano / 1e9,
-                                "high": c.high.units + c.high.nano / 1e9,
-                                "low": c.low.units + c.low.nano / 1e9,
-                                "close": c.close.units + c.close.nano / 1e9,
-                                "volume": c.volume,
-                            }
-                        )
-                    df = pd.DataFrame(candles)
-                    if not df.empty:
-                        df.set_index("time", inplace=True)
-                    return df
-            except Exception as e:
-                print(f"⚠️ Ошибка свечей: {e}")
-                return pd.DataFrame()
+            print(f"⚠️ Ошибка свечей: {e}")
+            return pd.DataFrame()
 
     async def get_candles_5m(self, figi: str, days: int = 7) -> pd.DataFrame:
         """Загрузка 5m‑свечей за days дней по FIGI для расчёта SMA50/200."""
@@ -827,15 +667,12 @@ class MainOrderExecutor:
                     from_=now - timedelta(days=days),
                     interval=CandleInterval.CANDLE_INTERVAL_5_MIN,
                 ):
-                    candles.append({
-                        "time": c.time,
-                        "open":  c.open.units  + c.open.nano  / 1e9,
-                        "high":  c.high.units  + c.high.nano  / 1e9,
-                        "low":   c.low.units   + c.low.nano   / 1e9,
-                        "close": c.close.units + c.close.nano / 1e9,
-                        "volume": int(getattr(c, "volume", 0)),
-                    })
-
+                    candles.append(
+                        {
+                            "time": c.time,
+                            "close": c.close.units + c.close.nano / 1e9,
+                        }
+                    )
                 df = pd.DataFrame(candles)
                 if not df.empty:
                     df.set_index("time", inplace=True)
@@ -1080,21 +917,21 @@ def calc_daily_change(candles: pd.DataFrame) -> float:
 
 def get_fundamental_news(max_len: int = 2500) -> str:
     try:
-        if not os.path.exists(NEWSFILE):
+        if not os.path.exists(NEWS_FILE):
             return ""
-        with open(NEWSFILE, "r", encoding="utf-8", errors="replace") as f:
+        with open(NEWS_FILE, "r", encoding="utf-8", errors="replace") as f:
             content = f.read().strip()
         if not content:
             return ""
         return content[:max_len]
     except Exception as e:
-        print(f"⚠️ Ошибка чтения {NEWSFILE}: {e}")
+        print(f"⚠️ Ошибка чтения {NEWS_FILE}: {e}")
         return ""
 
 
 def parse_trading_rules_from_news() -> dict:
     try:
-        if not os.path.exists(NEWSFILE):
+        if not os.path.exists(NEWS_FILE):
             return {
                 "bias": "neutral",
                 "max_buy_price": None,
@@ -1103,10 +940,9 @@ def parse_trading_rules_from_news() -> dict:
                 "forced_short": False,
                 "target_lots": None,
                 "short_conditions": None,
-                "force_weight": None,
             }
 
-        with open(NEWSFILE, 'r', encoding='utf-8') as f:
+        with open(NEWS_FILE, 'r', encoding='utf-8') as f:
             content = f.read()
         
         rules = {
@@ -1114,11 +950,11 @@ def parse_trading_rules_from_news() -> dict:
             "max_buy_price": None,
             "min_sell_price": None,
             "force_buy": "FORCE_BUY: TRUE" in content.upper(),
-            "forced_short": "FORCED_SHORT: YES" in content.upper(),
+            "forced_short": "FORCED_SHORT: YES" in content.upper(),  # ← ПАРСИМ SHORT
             "target_lots": None,
             "short_conditions": None,
-            "force_weight": None,
         }
+
 
         # Парсим BIAS (ищем разные варианты)
         bias_patterns = [
@@ -1151,7 +987,7 @@ def parse_trading_rules_from_news() -> dict:
                     rules["min_sell_price"] = float(numbers[0])
                     break
 
-        # Парсим TARGET_LOTS (новое)
+                # Парсим TARGET_LOTS (новое)
         match = re.search(r'TARGET_LOTS:\s*(\d+)', content)
         if match:
             rules["target_lots"] = int(match.group(1))
@@ -1161,12 +997,7 @@ def parse_trading_rules_from_news() -> dict:
         if match:
             rules["short_conditions"] = match.group(1).strip()
 
-        # Парсим FORCE_WEIGHT
-        match = re.search(r'FORCE_WEIGHT:\s*([0-9]*\.?[0-9]+)', content)
-        if match:
-            rules["force_weight"] = float(match.group(1))
-
-        #         # print(f"✅ Правила: BIAS={rules['bias'].upper()}, max_buy={rules['max_buy_price']}, min_sell={rules['min_sell_price']}, forced_short={rules['forced_short']}, target_lots={rules['target_lots']}, force_weight={rules['force_weight']}")
+        print(f"✅ Правила: BIAS={rules['bias'].upper()}, max_buy={rules['max_buy_price']}, min_sell={rules['min_sell_price']}, forced_short={rules['forced_short']}, target_lots={rules['target_lots']}")
 
         print(f"📰 Новости: прочитано {len(content)} символов")
 
@@ -1175,7 +1006,6 @@ def parse_trading_rules_from_news() -> dict:
     except Exception as e:
         print(f"❌ Ошибка парсинга: {e}")
         return {"bias": "neutral", "max_buy_price": None, "min_sell_price": None}
-
 
 
 
@@ -1391,15 +1221,17 @@ def log_decision_block(
         }
     }
 
-    # 3. Запись в файл (без обогащения, т.к. это sync функция)
-    # Обогащение произойдёт в main_loop асинхронно
+    # 3. Запись в файл shadow_agents_log.jsonl (БЕЗОПАСНАЯ)
     try:
         log_file = Path("shadow_agents_log.jsonl")
+        
+        # Гарантируем, что файл существует
         log_file.touch(exist_ok=True)
         
+        # Записываем строку в конец файла
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
-            f.flush()
+            f.flush()  # Явное сброс буфера на диск
         
     except PermissionError as e:
         print(f"⚠️ WARN: No write permission to shadow_agents_log.jsonl: {e}")
@@ -1407,11 +1239,6 @@ def log_decision_block(
         print(f"⚠️ WARN: OS error writing log: {e}")
     except Exception as e:
         print(f"⚠️ WARN: Unexpected error in logging: {type(e).__name__}: {e}")
-    
-    # Возвращаем log_entry для дальнейшего обогащения в main_loop
-    return log_entry
-
-
 
 
 
@@ -1563,22 +1390,20 @@ def decide_action(
     # HOLD enforcement
     if ai_signal == "HOLD" and lots == 0:
         return "NOOP", "🔒 HOLD: wait conviction", metadata
-
-    # HOLD with position...
+    
+    # HOLD de-risk (optimized delta safety)
     if ai_signal == "HOLD" and lots != 0:
-        return "NOOP", f"🔒 HOLD: keep position (lots={lots})", metadata
-
-    # RECOMPUTE delta after all target_lots adjustments
-    delta = target_lots - lots
-    metadata.update({"delta": delta, "target_lots": target_lots, "current_lots": lots})
-
+        safe_delta = delta
+        if lots < 0 and target_lots > 0 and delta > abs(lots): safe_delta = abs(lots)
+        if lots > 0 and target_lots < 0 and abs(delta) > lots: safe_delta = -lots
+        target_lots = 0
+        delta = safe_delta
+        return (f"BUY{abs(delta)}" if delta > 0 else f"SELL{abs(delta)}"), 
+    f"🔒 HOLD de-risk to 0 (was {lots})", metadata
+    
     # Final delta-driven
-    if delta > 0:
-        return f"BUY{abs(delta)}", f"GWDD Target{target_lots} cur{lots} BUY{abs(delta)}", metadata
-    if delta < 0:
-        return f"SELL{abs(delta)}", f"GWDD Target{target_lots} cur{lots} SELL{abs(delta)}", metadata
-
-
+    if delta > 0: return f"BUY{abs(delta)}", f"GWDD Target{target_lots} cur{lots} BUY{abs(delta)}", metadata
+    if delta < 0: return f"SELL{abs(delta)}", f"GWDD Target{target_lots} cur{lots} SELL{abs(delta)}", metadata
     
     return "NOOP", f"Aligned {lots}={target_lots} B{bullish_prob:.2f}S{bearish_prob:.2f}RSI{rsi:.1f}", metadata
 
@@ -1588,6 +1413,7 @@ def _env_bool(name: str, default: str = "false") -> bool:
     v = os.getenv(name, default)
     return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+from datetime import datetime, time
 import pytz
 
 def _is_opening_noise_window() -> bool:
@@ -1596,7 +1422,7 @@ def _is_opening_noise_window() -> bool:
     return time(9, 0) <= now <= time(9, 20)
 
 async def post_order_guarded(
-    executor: "MainOrderExecutor",
+    executor: "OrderExecutor",
     figi: str,
     direction: Literal["BUY", "SELL"],
     quantity: int,
@@ -1687,9 +1513,8 @@ async def main_loop():
 
     prev_lots = 0
 
-        # Initialize execution cooldown system
-    execution_cooldown_state = ExecutionCooldownState()
-    print(f"✅ EXECUTION COOLDOWN initialized: {execution_cooldown_state.COOLDOWNDURATION}s per signal, {execution_cooldown_state.GLOBALLOCKDURATION}s global lock")
+    executioncooldownstate = ExecutionCooldownState()
+    print(f"EXECUTION COOLDOWN initialized: {executioncooldownstate.COOLDOWNDURATION}s per-signal, {executioncooldownstate.GLOBALLOCKDURATION}s global lock")
 
     
     # Теперь это сработает для всех ключей
@@ -1704,7 +1529,7 @@ async def main_loop():
         sigma_rsi=10.0,
         sigma_prob=0.15,
         global_min_weight=0.50,
-        min_weight_conservative=0.55,
+        min_weight_conservative=0.65,
         min_weight_moderate=0.50,
         min_weight_aggressive=0.45,
         risk_mode_adjustments={
@@ -1715,7 +1540,7 @@ async def main_loop():
     )
     gwdd_engine = GWDDEngine(gwdd_config)
     risk_agent = RiskAgent()
-    executor = MainOrderExecutor(token)
+    executor = OrderExecutor(token)
     news_agent = UnifiedNewsAgent()
     weather_monitor = SynopticMonitor()
     sharedstate = SharedTradingState()
@@ -1734,7 +1559,7 @@ async def main_loop():
         pos = await get_position_data_safe(executor, ACTIVE_FIGI, retries=3)
         start_lots = int(pos.get("lots", 0))
         if start_lots > 0 and sharedstate.entry_time is None:
-            sharedstate.entry_time = time_module.time()
+            sharedstate.entry_time = time.time()
             print(f"⏰ Позиция {start_lots} лот при старте, entry_time установлен")
     except Exception as e:
         print(f"⚠️ Ошибка init entry_time: {e}")
@@ -1742,18 +1567,6 @@ async def main_loop():
 
     while True:
         try:
-            # ===== per-cycle defaults (MUST be before any gate/continue) =====
-            can_execute = False
-            qty = 0
-            block_reason = None
-            trade_allowed = False
-            is_position_reduction = False
-            action = "NOOP"
-            action_reason = ""
-            direction = "BUY"
-            orig_action = "NOOP"
-            orig_qty = 0
-
             now_msk = dt.datetime.now(pytz.timezone("Europe/Moscow"))
 
             # Блокируем торговлю до 09:00 МСК (аукцион открытия, гэпы)
@@ -1779,7 +1592,7 @@ async def main_loop():
             avg_price = float(pos["average_price"])
             
             if current_lots != prev_lots:
-                execution_cooldown_state.on_position_confirmed(current_lots, time_module.time())
+                executioncooldownstate.on_position_confirmed(current_lots, time.time())
                 print(f"POSITION CONFIRMED: {prev_lots}→{current_lots}, cooldowns RESET!")
             prev_lots = current_lots
             
@@ -1798,15 +1611,9 @@ async def main_loop():
                 sharedstate.position_direction = direction
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 sharedstate.p_high_since_entry = avg_price
-                sharedstate.entry_time = time_module.time()
+                sharedstate.entry_time = time.time()
                 sharedstate.p_low_since_entry = avg_price
 
-            elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
-                direction = "LONG" if current_lots > 0 else "SHORT"
-                atr_0 = float(data.get("ATR", 0.1)) if "data" in locals() else 0.1
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0)
-                sharedstate.sl_level = atr_stop.get_sl() or 0.0
-                print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
             elif prev_lots > 0 and current_lots == 0:
                 # Позиция полностью закрыта
                 atr_stop.on_close()
@@ -1821,7 +1628,7 @@ async def main_loop():
 
 
             # 2. Получение и анализ свечей
-            candles = await executor.get_candles_5m(ACTIVE_FIGI)
+            candles = await executor.get_candles(ACTIVE_FIGI)
             if candles.empty:
                 print("⚠️ Свечи не получены, ожидание 10с...")
                 await asyncio.sleep(10)
@@ -1830,7 +1637,7 @@ async def main_loop():
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
             
-            atr_t = float(data.get("ATR", 0.015))
+            atr_t = float(data.get("ATR", 0.1))
 
             # ATR STOP: открытие / закрытие
             if prev_lots == 0 and current_lots != 0:
@@ -1847,7 +1654,7 @@ async def main_loop():
                     sharedstate.p_high_since_entry = st.p_high_since_entry
                     sharedstate.p_low_since_entry = st.p_low_since_entry
 
-                    sharedstate.entry_time = time_module.time()
+                    sharedstate.entry_time = time.time()
             elif prev_lots > 0 and current_lots == 0:
                 atr_stop.on_close()
                 sharedstate.entry_time = None
@@ -1876,7 +1683,7 @@ async def main_loop():
                 pnl_pct = 0.0
             # Расчет времени удержания позиции
             if sharedstate.entry_time is not None:
-                holding_hours = (time_module.time() - sharedstate.entry_time) / 3600
+                holding_hours = (time.time() - sharedstate.entry_time) / 3600
             else:
                 holding_hours = 0.0
             rsi_val = float(data.get("RSI", 50.0))
@@ -1885,7 +1692,7 @@ async def main_loop():
             avg_volume_20 = int(candles["volume"].tail(20).mean()) if len(candles) >= 20 and "volume" in candles.columns else 1
             
             
-            atr_t = float(data.get("ATR", 0.015))
+            atr_t = float(data.get("ATR", 0.1))
 
             # === ATR STOP: OPEN/CLOSE & UPDATE ===
             # Открытие новой позиции
@@ -1903,7 +1710,7 @@ async def main_loop():
                     sharedstate.p_high_since_entry = st.p_high_since_entry
                     sharedstate.p_low_since_entry = st.p_low_since_entry
 
-                    sharedstate.entry_time = time_module.time()  # Сохраняем время открытия
+                    sharedstate.entry_time = time.time()  # Сохраняем время открытия
             # Полное закрытие позиции
             elif prev_lots > 0 and current_lots == 0:
                 atr_stop.on_close()
@@ -1928,7 +1735,7 @@ async def main_loop():
             
             # === ATR STOP: UPDATE SL ===
             if current_lots != 0:
-                atr_t = float(data.get("ATR", 0.015))
+                atr_t = float(data.get("ATR", 0.1))
                 atr_stop.on_update(price_t=current_price, atr_t=atr_t)
 
                 st = atr_stop.get_state()
@@ -2031,7 +1838,7 @@ async def main_loop():
                 "market_state": data.get("market_state", data.get("marketstate","RANGE")),
                 "news_summary": manual_news[:500],
             }
-          
+
             print("🧠 PLANNER: Синтез торговой стратегии...")
             # --- PLANNER CONTEXT SAFE DEFAULTS ---
             trend_h1 = trend_5m
@@ -2050,49 +1857,17 @@ async def main_loop():
 
                 "news_summary": manual_news[:500],
             }
-            
-
-            try:
-                plan_result = await asyncio.wait_for(
-                    asyncio.to_thread(planner.create_plan, market_context),
-                    timeout=30,  # ← УВЕЛИЧЕНО с 20 до 30
-                )
-            except asyncio.TimeoutError:
-                print("⚠️ PLANNER TIMEOUT (30s) -> fallback CONSERVATIVE")
-                plan_result = {
-                    "bias": "NEUTRAL",  # ← Более безопасный fallback (вместо current_bias)
-                    "risk_mode": "CONSERVATIVE",  # ← Добавлено (для совместимости)
-                    "mode": "CONSERVATIVE",
-                    "strategy": "NEUTRAL",
-                    "reason": "planner timeout",
-                    "force_weight": 0.55,  # ← КРИТИЧНО: чтобы проходил порог CONSERVATIVE
-                }
-            except Exception as e:
-                print(f"⚠️ PLANNER ERROR -> fallback CONSERVATIVE: {e}")
-                plan_result = {
-                    "bias": "NEUTRAL",  # ← Более безопасный fallback
-                    "risk_mode": "CONSERVATIVE",
-                    "mode": "CONSERVATIVE",
-                    "strategy": "NEUTRAL",
-                    "reason": f"planner error: {e}",
-                    "force_weight": 0.55,  # ← КРИТИЧНО
-                }
-
-            print(f"🧠 PLANNER RESULT: mode={plan_result.get('mode')} bias={plan_result.get('bias')} reason={plan_result.get('reason','')}")
-
-            final_bias = plan_result.get("bias", "NEUTRAL")  # ← Fallback на NEUTRAL вместо current_bias
-
+            plan_result = planner.create_plan(market_context)
+            final_bias = plan_result.get("bias", current_bias)
 
             # 8. Погода как фильтр
             weather_allowed = True
-            block_reason = None
+            block_reason = ""
             # === SMART WEATHER OVERRIDE ===
             weather_impact = weather_data.get("demand_impact_pct", 0)
             arctic_score = weather_data.get("arctic_blast_score", 0.0)
-            # FIX: убираем ложный extreme, если метрики не рассчитаны
-            is_extreme = bool(weather_data.get("is_extreme")) and (weather_impact > 0 or arctic_score > 0)
             
-            if is_extreme:
+            if weather_data.get("is_extreme"):
                 # Проверяем EXTREME OVERSOLD override
                 if rsi_val < 20 and news_result.bullish_prob > 0.20:
                     if weather_impact < 90:
@@ -2132,15 +1907,6 @@ async def main_loop():
                     risk_mode=gwdd_mode,
                     news_text=full_context,
                 )
-                
-                
-               
-                # Override weight если задан FORCE_WEIGHT из Planner
-                planner_force_weight = plan_result.get("force_weight")
-                if planner_force_weight is not None:
-                    entry_weight = planner_force_weight
-                    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight}")
-
 
                 should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
                     entry_weight=entry_weight,
@@ -2175,17 +1941,19 @@ async def main_loop():
             
 
             # GWDD может перекрыть решение risk_agent
+            # НО: EXTREME OVERSOLD override имеет приоритет
             if not should_enter and news_result.signal in ["BUY", "SELL"]:
-                trade_allowed = False
-                block_reason = f"GWDD_BLOCK: {gwdd_reason}"
+                # Проверяем EXTREME OVERSOLD исключение
+                is_extreme_oversold = (rsi_val < 20 and news_result.bullish_prob > 0.20 and current_lots == 0)
+                is_extreme_overbought = (rsi_val > 80 and news_result.bearish_prob > 0.20 and current_lots == 0)
+                
+                if not (is_extreme_oversold or is_extreme_overbought):
+                    trade_allowed = False
+                    block_reason = f"GWDD_BLOCK: {gwdd_reason}"
+                else:
+                    print(f"⚡ GWDD OVERRIDE: EXTREME condition (RSI {rsi_val:.1f}) bypasses GWDD block")
 
 
-            # Если уже в позиции, GWDD Lots=0 (SKIP) не должен обнулять target -> держим текущие лоты
-            if current_lots != 0 and position_size == 0:
-                position_size = abs(current_lots)
-
-            
-            
             # ⚡ GWDD: target_lots зависит от ai_signal (SELL = SHORT, отрицательный)
             if news_result.signal == "SELL":
                 target_lots_signed = -position_size  # SHORT: отрицательные лоты
@@ -2215,32 +1983,7 @@ async def main_loop():
                 pnl_pct=pnl_pct,
             )
             
-         
-	
-            # --- SLEEPING MARKET GATE (Variant B): block only GWDD Target rebalance in FLAT ---
-            sleeping_market = (trend_5m == "FLAT")
-
-            if sleeping_market and isinstance(action_reason, str) and action_reason.startswith("GWDD Target"):
-                # Вариант B: блокируем только ребаланс GWDD Target в сонном рынке.
-                # Аварийные выходы не должны начинаться с "GWDD Target", но оставим страховку.
-                risk_exit_markers = (
-                    "Clearing protection",
-                    "Clearing lock",
-                    "ATR SL",
-                    "SL hit",
-                    "STOP",
-                    "Emergency",
-                    "HOLD de-risk",
-                    "FORCED",
-                )
-                is_risk_exit = any(m in action_reason for m in risk_exit_markers)
-
-                if not is_risk_exit:
-                    print(f"😴 SLEEPING MARKET: blocked {action} | {action_reason}")
-                    action = "NOOP"
-                    action_reason = f"SLEEPING MARKET: blocked {action_reason}"
-            # --- END SLEEPING MARKET GATE ---
-
+            
             
             # Разделяем ИСПОЛНЕНИЕ на управление позицией и новые входы
             if action != "NOOP":
@@ -2253,13 +1996,10 @@ async def main_loop():
                     (direction == "BUY" and current_lots < 0)
                 )
 
-  
                 # 2) Исполнение разрешено если:
-                #    - это снижение риска (закрытие/частичное закрытие) И это реальный risk-exit, ИЛИ
+                #    - это снижение риска (закрытие/частичное закрытие), ИЛИ
                 #    - фильтры разрешили торговлю (новый вход / добор)
-                is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
-                can_execute = (is_position_reduction and is_risk_exit) or trade_allowed
-
+                can_execute = is_position_reduction or trade_allowed
                 
                 # 3) Clearing lock: за 30 минут до клиринга запрещаем увеличивать риск (|lots|)
                 minutes_to_clearing = get_minutes_to_clearing()
@@ -2304,8 +2044,8 @@ async def main_loop():
                     action_reason = f"{action_reason} | CLAMP {orig_action}->{action} (lots={current_lots})"
                     
                 # === COOLDOWN CHECK BLOCK 4 ===
-                now = time_module.time()
-                shouldskip, remaining = execution_cooldown_state.is_cooldown_active(action, action_reason, now)
+                now = time.time()
+                shouldskip, remaining = executioncooldownstate.is_cooldown_active(action, action_reason, now)
                 if shouldskip:
                     skip_reason = f"COOLDOWN {action} {remaining:.1f}s (duplicate protection)"
                     print(skip_reason)
@@ -2313,75 +2053,12 @@ async def main_loop():
 
                 # Record success ДОЛЖЕН БЫТЬ после post_order_guarded success
 
-                can_execute = bool(is_position_reduction or trade_allowed)
-                if action == "NOOP":
-                    can_execute = False
-                    qty = 0
-                
-                # --- DEBUG EXEC (compact) ---
-                why_block = (
-                    block_reason
-                    or risk_verdict.get("reason")
-                    or ("NOOP" if action == "NOOP" else None)
-                    or "unknown"
-                )
 
-                print(
-                    f"DEBUG_EXEC cycle={cycle} action={action} dir={direction} qty={qty} "
-                    f"lots={current_lots} can={can_execute} allowed={trade_allowed} "
-                    f"reduct={is_position_reduction} why={why_block}"
-                )
-
-                print(
-                    f"DEBUG_GATES trade_allowed={trade_allowed} "
-                    f"block_reason={block_reason} action_reason={action_reason}"
-                )
-                # GWDD BLOCK: Если trade_allowed=False, блокируем исполнение
-                if not trade_allowed:
-                    print(f"🚫 BLOCKED: {block_reason}")
-                    action = "NOOP"
-                    action_reason = f"Blocked: {block_reason}"
-
-               
 
                 if can_execute and qty > 0:
                     print(f"➡️ EXECUTION: {action} | Risk Score: {risk_verdict.get('risk_score', 0)}")
                     print(f"   -> CLAMPED: direction={direction} qty={qty} current_lots={current_lots}")
-                    
-                    # КРИТИЧНО: Финальная проверка перед отправкой ордера
-                    if action == "NOOP":
-                        print(f"⛔ ORDER BLOCKED: action=NOOP after trade_allowed check")
-                    else:
-                        ok = await post_order_guarded(executor, ACTIVE_FIGI, direction, qty, why=action_reason)
-                        
-                        if ok:
-                            await asyncio.sleep(0.7)
-                            pos = await executor.get_position_data(ACTIVE_FIGI)
-                            current_lots = int(pos.get("lots", current_lots))
-                            print(f"✅ POSITION AFTER ORDER: {pos}")
-                            print(f"DEBUG_SYNC lots_before_log: current_lots={current_lots}, pos_lots={pos.get('lots')}")
-                            
-                            # Инициализация Trailing Stop ПОСЛЕ успешного ордера
-                            if current_lots > 0 and direction == "BUY":
-                                print(f"🔧 DEBUG MAIN: atr_t={atr_t:.4f}, trend={trend_5m}, entry={pos.get('average_price', current_price):.4f}")
-                                
-                                trailing_stop = TrailingStopManager(
-                                    entry_price=pos.get("average_price", current_price),
-                                    atr=atr_t,  # ← ИСПРАВЛЕНО
-                                    trend=trend_5m  # ← ИСПРАВЛЕНО (trend может быть не определён)
-                                )
-                            elif current_lots < 0 and direction == "SELL":
-                                print(f"🔧 DEBUG MAIN SHORT: atr_t={atr_t:.4f}, trend={trend_5m}, entry={pos.get('average_price', current_price):.4f}")
-                                
-                                trailing_stop = TrailingStopManagerShort(
-                                    entryprice=pos.get("average_price", current_price),
-                                    atr=atr_t,  # ← ИСПРАВЛЕНО
-                                    trend=trend_5m  # ← ИСПРАВЛЕНО
-                                )
-
-
-
-
+                    await post_order_guarded(executor, ACTIVE_FIGI, direction, qty, why=action_reason)
                 else:
                     why_block = block_reason or risk_verdict.get("reason", "Blocked by filter")
                     print(f"🚫 BLOCKED: {why_block}")
@@ -2389,8 +2066,35 @@ async def main_loop():
 
 
 
-            # === LOG DECISION & ENRICH WITH BROKER DATA ===
-            cycle_event = log_decision_block(
+                # Парсим количество из BUY2 / SELL3 / BUYALL / SELLALL
+                qty = 1
+                if action in ("BUYALL", "SELLALL"):
+                    qty = abs(current_lots)  # закрыть текущую позицию целиком
+                else:
+                    suffix = action[3:]  # после BUY / SELL
+                    if suffix.isdigit():
+                        qty = int(suffix)
+                    else:
+                        qty = 1
+
+                if can_execute and qty > 0:
+                    print(
+                        f"➡️ EXECUTION: {action} | "
+                        f"Risk Score: {risk_verdict.get('risk_score', 0)}"
+                    )
+                    await post_order_guarded(
+                        executor, ACTIVE_FIGI, direction, qty, why=action_reason
+                    )
+                else:
+                    why_block = (
+                        block_reason or risk_verdict.get("reason", "Blocked by filter")
+                    )
+                    print(f"🚫 BLOCKED: {why_block}")
+
+
+
+
+            log_decision_block(
                 cycle=cycle,
                 price=current_price,
                 rsi=rsi_val,
@@ -2410,25 +2114,11 @@ async def main_loop():
                 avg_confidence=decision_metadata.get("avg_confidence", 0.0),
             )
             
-            # Обогащаем данными из broker API
-            enriched_event = await enrich_cycle_event(
-                cycle_data=cycle_event,
-                executor=executor,
-                active_figi=ACTIVE_FIGI,
-                session_id=session_id
-            )
-            
-            # Записываем обогащённое событие в новый JSONL
-            try:
-                with open(jsonl_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(enriched_event, ensure_ascii=False) + "\n")
-                    f.flush()
-            except Exception as e:
-                print(f"⚠️ WARN: Failed to write enriched JSONL: {e}")
+
 
 
             if getattr(settings, "TELEGRAM_DECISION_NOTIFICATIONS", False):
-                if can_execute and qty > 0:
+                if action not in ("NOOP", "WAIT", "HOLD"):
                     await send_telegram(
                         f"🧠 <b>DECISION</b>\n"
                         f"Cycle: {cycle}\n"
@@ -2436,8 +2126,7 @@ async def main_loop():
                         f"AI: {news_result.signal} {news_result.confidence:.0f}\n"
                         f"Action: {action}\n"
                         f"Reason: {action_reason}"
-                    )
-
+        )
 
 
 

@@ -23,18 +23,21 @@ class PlannerAgent:
             temperature=0.1,
             api_key=settings.OPENROUTER_API_KEY,
             base_url=settings.OPENROUTER_BASE_URL,
+            timeout=30,  # ← ДОБАВИТЬ
+            request_timeout=30,  # ← ДОБАВИТЬ (для старых версий langchain)
             model_kwargs={"response_format": {"type": "json_object"}},
         )
-
     # ---- Совместимость с ShadowAdapter ----
     def createplan(self, agent_state: Dict[str, Any]) -> Dict[str, Any]:
         """
-        ShadowAdapter вызывает planner.createplan(agent_state). [file:62]
+        ShadowAdapter вызывает planner.createplan(agent_state).
         """
         market_context: Dict[str, Any] = {
             "ticker": agent_state.get("ticker", "NG"),
             "trend_d1": agent_state.get("trend_d1", "UNKNOWN"),
             "trend_h1": agent_state.get("trendh1", agent_state.get("trend_h1", "UNKNOWN")),
+            "trend_5m": agent_state.get("trend_5m", agent_state.get("trend5m", "UNKNOWN")),
+            "market_state": agent_state.get("market_state", agent_state.get("marketstate", "UNKNOWN")),
             "news_summary": agent_state.get("newssummary", agent_state.get("news_summary", "")),
         }
         return self.create_daily_plan(market_context)
@@ -48,6 +51,18 @@ class PlannerAgent:
         Фундаментальный слой: сезон + ArcticBlastScore + EIA (Draw/Injection).
         """
         raw_news = str(market_context.get("news_summary", "") or "")
+
+        # --- 0) Trend override (детерминированный) ---
+        # Цель: стабилизировать bias под текущий тренд/состояние рынка,
+        # чтобы не было "паралича" при IMPULSE_UP.
+        trend_5m = str(market_context.get("trend_5m", "UNKNOWN")).upper()
+        market_state = str(market_context.get("market_state", "UNKNOWN")).upper()
+
+        trend_bias = "NEUTRAL"
+        if market_state in ("IMPULSE_UP", "IMPULSEUP") or trend_5m in ("IMPULSE_UP", "UPTREND", "UP"):
+            trend_bias = "BULLISH"
+        elif market_state in ("IMPULSE_DOWN", "IMPULSEDOWN") or trend_5m in ("IMPULSE_DOWN", "DOWNTREND", "DOWN"):
+            trend_bias = "BEARISH"
 
         # --- 1) Фундаментальные флаги из news_summary ---
         arctic_score = 0.0
@@ -74,8 +89,6 @@ class PlannerAgent:
             season = "SUMMER"
 
         # --- 3) Базовый LLM-план ---
-        # ВАЖНО: JSON ниже экранирован двойными {{ ... }},
-        # иначе LangChain воспринимает { "bias": ... } как переменную шаблона. [file:62]
         template = """
 SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда.
 Твоя задача - определить глобальное направление торговли на сегодня.
@@ -84,6 +97,8 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
 Инструмент: {ticker}
 Дневной Тренд (D1): {d1_trend}
 Часовой Тренд (H1): {h1_trend}
+Текущий Тренд (5m): {trend_5m}
+Состояние рынка (market_state): {market_state}
 Фундаментальный фон (новости + погода + запасы): {news}
 
 ПРАВИЛА:
@@ -106,9 +121,10 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
 
         input_data = {
             "ticker": market_context.get("ticker", "NG"),
-            # твои ключи в market_context: trend_d1 / trend_h1 [file:76]
             "d1_trend": market_context.get("trend_d1", "UNKNOWN"),
             "h1_trend": market_context.get("trend_h1", "UNKNOWN"),
+            "trend_5m": market_context.get("trend_5m", "UNKNOWN"),
+            "market_state": market_context.get("market_state", "UNKNOWN"),
             "news": raw_news or "Нет новостей",
         }
 
@@ -126,6 +142,15 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
         base_bias = str(plan.get("bias", "NEUTRAL"))
         base_risk = str(plan.get("risk_mode", "CONSERVATIVE"))
         reason = str(plan.get("reason", "") or "")
+
+        # --- 3.5) Применяем Trend override как первичный bias ---
+        # Переводим BULLISH/BEARISH в доступные режимы bias движка (LONG_ONLY/SHORT_ONLY).
+        if trend_bias == "BULLISH":
+            base_bias = "LONG_ONLY"
+            reason = (reason + " | Trend override: IMPULSE_UP/UPTREND -> LONG_ONLY.").strip(" |")
+        elif trend_bias == "BEARISH":
+            base_bias = "SHORT_ONLY"
+            reason = (reason + " | Trend override: IMPULSE_DOWN/DOWNTREND -> SHORT_ONLY.").strip(" |")
 
         # --- 4) Фундаментальный слой ---
         fundamental_note: list[str] = []
@@ -152,14 +177,21 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
         if fundamental_note:
             final_reason = (reason + " | " + " ".join(fundamental_note)).strip()
 
+        # Определяем FORCE_WEIGHT на основе risk_mode
+        force_weight = 0.50  # Default для CONSERVATIVE
+        if base_risk == "NORMAL":
+            force_weight = 0.60
+        elif base_risk == "AGGRESSIVE":
+            force_weight = 0.70
+
         final_plan: Dict[str, Any] = {
             "bias": base_bias,
             "risk_mode": base_risk,
             "reason": final_reason,
-            # КЛЮЧ ДЛЯ SHADOW-ЛОГА:
-            # ShadowAdapter.getsignal() читает res.get("signal") или res.get("action"). [file:62]
             "signal": base_bias,
+            "force_weight": force_weight,  # ← ДОБАВИТЬ
         }
+
 
         print(f"📜 [Planner] Стратегия на сессию: {final_plan['bias']} ({final_plan['risk_mode']})")
         return final_plan

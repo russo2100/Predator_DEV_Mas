@@ -1,3 +1,4 @@
+from typing import Optional
 from dataclasses import dataclass
 from typing import Optional
 
@@ -45,3 +46,12 @@ class SharedTradingState:
     # GWDD (Gaussian Weight Distribution Dynamics)
     gwdd_weight: float = 0.0        # итоговый вес входа от GWDD
     suggested_lots: int = 0         # размер позиции, предложенный GWDD
+    
+        # ATR-based dynamic stop state
+    atr_at_entry: float = 0.0
+    p_high_since_entry: float = 0.0
+    p_low_since_entry: float = 0.0
+    sl_level: float = 0.0
+    position_direction: str = ""  # "LONG" / "SHORT" / ""
+
+    entry_time: Optional[float] = None  # Unix timestamp открытия позиции

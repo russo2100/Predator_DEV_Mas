@@ -1,0 +1,14 @@
+ng_futures:
+  contracts:
+    - code: NRF6
+      figi: FUTNGM012600
+      uid: ""
+      month: 1
+      year: 2026
+      expiry_date: "2026-01-31T00:00:00Z"
+    - code: NRG6
+      figi: FUTNGM022600
+      uid: ""
+      month: 2
+      year: 2026
+      expiry_date: "2026-02-27T00:00:00Z"

@@ -1,0 +1,34 @@
+ng_futures:
+  base_ticker: "NG"
+  market: "MOEX_FORTS"
+  contracts:
+    - code: "NRF6"
+      figi: "FUTNGM012600"
+      uid: "23822ad1-37cf-430b-9eb0-43f0dbc504b1"
+      month: 1
+      year: 2026
+      expiry_date: "2026-01-28T11:05:00+03:00"
+    - code: "NRG6"
+      figi: "FUTNGM022600"
+      uid: "2e05f080-9642-44e5-931d-fc8299e4e5ac"
+      month: 2
+      year: 2026
+      expiry_date: "2026-02-26T11:05:00+03:00"
+    - code: "NRH6"
+      figi: "FUTNGM032600"
+      uid: "77ab672d-e7f4-4b9a-b02d-c9d405576a48"
+      month: 3
+      year: 2026
+      expiry_date: "2026-03-26T11:05:00+03:00"
+    - code: "NRJ6"
+      figi: "FUTNGM042600"
+      uid: "04b4c8f7-ede5-4450-95af-5c3af8ed641d"
+      month: 4
+      year: 2026
+      expiry_date: "2026-04-24T11:05:00+03:00"
+    - code: "NRK6"
+      figi: "FUTNGM052600"
+      uid: "6800f624-45d2-41cb-b376-d02b3d625b8a"
+      month: 5
+      year: 2026
+      expiry_date: "2026-05-27T11:05:00+03:00"
