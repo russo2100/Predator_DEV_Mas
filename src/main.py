@@ -163,7 +163,7 @@ ACTIVE_FIGI = ACTIVE_NG_CONTRACT.figi
 ACTIVE_TICKER = ACTIVE_NG_CONTRACT.code
 ACTIVE_UID = ACTIVE_NG_CONTRACT.uid
 
-print(f"🔍 DEBUG expiry: {ACTIVE_NG_CONTRACT.expiry} | ISO: {ACTIVE_NG_CONTRACT.expiry.isoformat()}")
+
 print(f"✅ Active contract: {ACTIVE_TICKER} | FIGI: {ACTIVE_FIGI} | Expiry: {ACTIVE_NG_CONTRACT.expiry.strftime('%Y-%m-%d')}")
 
 # ========== END ACTIVE CONTRACT ==========
