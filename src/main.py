@@ -1683,7 +1683,7 @@ async def main_loop():
     from src.shared_state import SharedTradingState
     
     sharedstate = SharedTradingState()
-    atr_stop = ATRStopEngine(k_sl=0.5, m_be=1.0)
+    atr_stop = ATRStopEngine()  # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
     prev_lots = 0
 
@@ -1719,7 +1719,7 @@ async def main_loop():
     news_agent = UnifiedNewsAgent()
     weather_monitor = SynopticMonitor()
     sharedstate = SharedTradingState()
-    atr_stop = ATRStopEngine(k_sl=0.5, m_be=1.0)
+    atr_stop = ATRStopEngine()  # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
     print("👻 Hybrid Architecture v2.0: Режим активного мониторинга запущен.")
     await send_telegram("🚀 Predator v2.0: Bayesian Engine + Synoptic Monitor активны.")
@@ -1787,7 +1787,8 @@ async def main_loop():
             if prev_lots == 0 and current_lots != 0:
                 # Открылась новая позиция
                 direction = "LONG" if current_lots > 0 else "SHORT"  # ← ДИНАМИЧЕСКИЙ direction
-                atr_0 = float(data.get("ATR", 0.1)) if 'data' in locals() else 0.1
+                atr_0 = float(data.get("ATR", 0.015)) if 'data' in locals() else 0.015
+
 
                 atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0)
 
@@ -1803,7 +1804,8 @@ async def main_loop():
 
             elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
                 direction = "LONG" if current_lots > 0 else "SHORT"
-                atr_0 = float(data.get("ATR", 0.1)) if "data" in locals() else 0.1
+                atr_0 = float(data.get("ATR", 0.015)) if 'data' in locals() else 0.015
+
                 atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0)
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
@@ -1835,7 +1837,8 @@ async def main_loop():
             # ATR STOP: открытие / закрытие
             if prev_lots == 0 and current_lots != 0:
                 direction = "LONG" if current_lots > 0 else "SHORT"  # ← ДИНАМИЧЕСКИЙ
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t)
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t, trend=trend_5m)
+
 
 
                 st = atr_stop.get_state()
@@ -1861,7 +1864,7 @@ async def main_loop():
 
             # Если позиция уже открыта — просто подтягиваем стоп
             if current_lots > 0:
-                atr_stop.on_update(price_t=current_price, atr_t=atr_t)
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=data.get("trend", "FLAT"))
                 st = atr_stop.get_state()
                 if st is not None:
                     sharedstate.sl_level = st.sl_level
@@ -1893,7 +1896,8 @@ async def main_loop():
                 # TODO: когда появятся реальные шорты — добавить определение направления
                 direction = "LONG" if current_lots > 0 else "SHORT"
 
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t)
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t, trend=trend_5m)
+
                 st = atr_stop.get_state()
                 if st is not None:
                     sharedstate.entry_price = st.entry_price
@@ -1918,7 +1922,7 @@ async def main_loop():
 
             # Обновление стопа, если позиция открыта
             if current_lots != 0:
-                atr_stop.on_update(price_t=current_price, atr_t=atr_t)
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=data.get("trend", "FLAT"))
                 st = atr_stop.get_state()
                 if st is not None:
                     sharedstate.sl_level = st.sl_level
@@ -1929,7 +1933,7 @@ async def main_loop():
             # === ATR STOP: UPDATE SL ===
             if current_lots != 0:
                 atr_t = float(data.get("ATR", 0.015))
-                atr_stop.on_update(price_t=current_price, atr_t=atr_t)
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=data.get("trend", "FLAT"))
 
                 st = atr_stop.get_state()
                 if st is not None:
@@ -1998,7 +2002,7 @@ async def main_loop():
                     "reason": "",
                 },
                 market_data={
-                    "ATR": data.get("ATR", 0.1),
+                    "ATR": data.get("ATR", 0.15),
                     "RSI": rsi_val,
                     "ATRSL": data.get("ATRSL", 0.05),
                     "ATRTP": data.get("ATRTP", 0.15),
@@ -2209,7 +2213,7 @@ async def main_loop():
                 minutes_to_clearing=get_minutes_to_clearing(),
                 current_volume=current_volume,
                 avg_volume=avg_volume_20,
-                atr=data.get("ATR", 0.1),
+                atr=data.get("ATR", 0.15),
                 current_price=current_price,
                 sl_level=sharedstate.sl_level,
                 pnl_pct=pnl_pct,

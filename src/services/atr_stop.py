@@ -1,55 +1,90 @@
+"""
+ATR Stop-Loss Engine с адаптацией по тренду.
+Unified logic для LONG и SHORT позиций.
+"""
+
 from dataclasses import dataclass
 from typing import Optional
 
 
 @dataclass
 class ATRStopState:
+    """Состояние ATR Stop-Loss"""
     entry_price: float
     atr_at_entry: float
     sl_level: float
     p_high_since_entry: float
     p_low_since_entry: float
     direction: str  # "LONG" or "SHORT"
+    trend: str  # "UPTREND", "DOWNTREND", "FLAT"
 
 
 class ATRStopEngine:
     """
-    Движок динамического стопа по ATR.
-
-    Общая идея:
-    - При открытии позиции фиксируем entry_price и ATR_0.
-    - На каждом цикле обновляем экстремумы цены (P_high / P_low).
-    - Считаем кандидат на новый SL через k_sl * ATR_t.
-    - Стоп двигается только в сторону уменьшения риска.
-    - При прибыли >= m_be * ATR_0 подтягиваем SL не ниже/выше точки входа (безубыток).
+    Движок динамического стопа по ATR с адаптацией по тренду.
+    
+    Основные принципы:
+    - При открытии позиции фиксируем entry_price, ATR_0 и trend
+    - SL рассчитывается как: entry ± (ATR * k_sl)
+    - k_sl зависит от тренда:
+      - LONG + UPTREND: k_sl = 2.0 (шире стоп)
+      - SHORT + DOWNTREND: k_sl = 2.0 (шире стоп)
+      - Остальное: k_sl = 1.5 (стандартный стоп)
+    - На каждом цикле обновляем экстремумы и trailing stop
+    - Стоп двигается только в сторону уменьшения риска
+    - При прибыли >= m_be * ATR_0 подтягиваем к безубытку
     """
 
-    def __init__(self, k_sl: float = 1.5, m_be: float = 1.0):
+    def __init__(self, k_sl_uptrend: float = 2.0, k_sl_other: float = 1.5, m_be: float = 1.0):
         """
-        k_sl  – множитель ATR для расчёта стопа.
-        m_be  – множитель ATR_0 для перевода стопа в безубыток.
+        k_sl_uptrend – множитель ATR для позиций по тренду (LONG+UP, SHORT+DOWN)
+        k_sl_other – множитель ATR для остальных случаев
+        m_be – множитель ATR_0 для перевода стопа в безубыток
         """
-        self.k_sl = k_sl
+        self.k_sl_uptrend = k_sl_uptrend
+        self.k_sl_other = k_sl_other
         self.m_be = m_be
         self.state: Optional[ATRStopState] = None
 
-    def on_open(self, direction: str, entry_price: float, atr_0: float) -> None:
+    def on_open(self, direction: str, entry_price: float, atr_0: float, trend: str = "FLAT") -> None:
         """
-        Вызывается один раз при открытии новой позиции.
+        Вызывается при открытии новой позиции.
+        
         direction: "LONG" или "SHORT"
+        entry_price: цена входа
+        atr_0: ATR на момент входа
+        trend: текущий тренд ("UPTREND", "DOWNTREND", "FLAT")
         """
         if direction not in ("LONG", "SHORT"):
             raise ValueError(f"Invalid direction for ATRStopEngine: {direction}")
-
+        
         if atr_0 <= 0:
             # Защита от мусорного ATR
-            atr_0 = 0.01
+             atr_0 = 0.015 
 
+
+        
+        # Определить k_sl на основе направления и тренда
+        if (direction == "LONG" and trend == "UPTREND") or (direction == "SHORT" and trend == "DOWNTREND"):
+            k_sl = self.k_sl_uptrend  # 2.0 для позиций по тренду
+        else:
+            k_sl = self.k_sl_other  # 1.5 для остальных
+        
+        # Рассчитать initial SL
         if direction == "LONG":
-            sl0 = entry_price - self.k_sl * atr_0
+            sl0 = entry_price - k_sl * atr_0
         else:  # SHORT
-            sl0 = entry_price + self.k_sl * atr_0
-
+            sl0 = entry_price + k_sl * atr_0
+        
+        # Минимальный offset (1% от entry)
+        min_offset = entry_price * 0.01
+        if direction == "LONG":
+            if (entry_price - sl0) < min_offset:
+                sl0 = entry_price - min_offset
+        else:  # SHORT
+            if (sl0 - entry_price) < min_offset:
+                sl0 = entry_price + min_offset
+        
         self.state = ATRStopState(
             entry_price=entry_price,
             atr_at_entry=atr_0,
@@ -57,18 +92,32 @@ class ATRStopEngine:
             p_high_since_entry=entry_price,
             p_low_since_entry=entry_price,
             direction=direction,
+            trend=trend,
+        )
+        
+        # DEBUG вывод
+        offset = abs(entry_price - sl0)
+        print(
+            f"🔧 DEBUG ATR ENGINE: atr={atr_0:.4f}, trend={trend}, k_sl={k_sl:.1f}, "
+            f"direction={direction}"
+        )
+        print(
+            f"🎯 ATR Stop инициализирован: entry={entry_price:.4f}, offset={offset:.4f} "
+            f"({trend}), SL={sl0:.4f}"
         )
 
     def on_close(self) -> None:
-        """
-        Вызывается при полном закрытии позиции.
-        """
+        """Вызывается при полном закрытии позиции."""
         self.state = None
 
-    def on_update(self, price_t: float, atr_t: float) -> None:
+    def on_update(self, price_t: float, atr_t: float, trend: str = "FLAT") -> None:
         """
         Вызывается на каждом цикле, пока позиция открыта.
-        Обновляет p_high/p_low, кандидатный SL и безубыток.
+        Обновляет p_high/p_low, trailing SL и безубыток.
+        
+        price_t: текущая цена
+        atr_t: текущий ATR
+        trend: текущий тренд (может меняться)
         """
         if self.state is None:
             return
@@ -76,7 +125,17 @@ class ATRStopEngine:
         s = self.state
 
         if atr_t <= 0:
-            atr_t = s.atr_at_entry if s.atr_at_entry > 0 else 0.01
+            atr_t = s.atr_at_entry if s.atr_at_entry > 0 else 0.015
+
+        # Обновление тренда (если изменился)
+        if trend != s.trend:
+            s.trend = trend
+
+        # Определить k_sl на основе текущего тренда
+        if (s.direction == "LONG" and s.trend == "UPTREND") or (s.direction == "SHORT" and s.trend == "DOWNTREND"):
+            k_sl = self.k_sl_uptrend
+        else:
+            k_sl = self.k_sl_other
 
         # Обновление экстремумов
         if s.direction == "LONG":
@@ -84,31 +143,53 @@ class ATRStopEngine:
         else:
             s.p_low_since_entry = min(s.p_low_since_entry, price_t)
 
-        # Кандидат на новый стоп
+        # Кандидат на новый стоп (trailing)
         if s.direction == "LONG":
-            sl_candidate = s.p_high_since_entry - self.k_sl * atr_t
-            # Только в сторону уменьшения риска
+            sl_candidate = s.p_high_since_entry - k_sl * atr_t
+            # Только в сторону уменьшения риска (вверх для LONG)
             sl_new = max(s.sl_level, sl_candidate)
 
             # Безубыток: прибыль >= m_be * ATR_0
             profit = price_t - s.entry_price
             if profit >= self.m_be * s.atr_at_entry:
                 sl_new = max(sl_new, s.entry_price)
+            
+            # Если SL поднялся, вывести в лог
+            if sl_new > s.sl_level:
+                profit_pct = (price_t - s.entry_price) / s.entry_price * 100
+                print(
+                    f"🔼 Trailing Stop LONG поднят: {s.sl_level:.4f} → {sl_new:.4f} "
+                    f"(high={s.p_high_since_entry:.4f}, profit={profit_pct:+.2f}%)"
+                )
+
         else:  # SHORT
-            sl_candidate = s.p_low_since_entry + self.k_sl * atr_t
+            sl_candidate = s.p_low_since_entry + k_sl * atr_t
+            # Только в сторону уменьшения риска (вниз для SHORT)
             sl_new = min(s.sl_level, sl_candidate)
 
+            # Безубыток
             profit = s.entry_price - price_t
             if profit >= self.m_be * s.atr_at_entry:
                 sl_new = min(sl_new, s.entry_price)
+            
+            # Если SL снизился, вывести в лог
+            if sl_new < s.sl_level:
+                profit_pct = (s.entry_price - price_t) / s.entry_price * 100
+                print(
+                    f"🔽 Trailing Stop SHORT снижен: {s.sl_level:.4f} → {sl_new:.4f} "
+                    f"(low={s.p_low_since_entry:.4f}, profit={profit_pct:+.2f}%)"
+                )
 
         s.sl_level = sl_new
 
     def get_sl(self) -> Optional[float]:
+        """Получить текущий уровень SL"""
         return self.state.sl_level if self.state else None
 
     def get_direction(self) -> Optional[str]:
+        """Получить направление позиции"""
         return self.state.direction if self.state else None
 
     def get_state(self) -> Optional[ATRStopState]:
+        """Получить полное состояние"""
         return self.state
