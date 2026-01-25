@@ -76,13 +76,27 @@ def load_ng_contracts(config_path: str = "contracts.yaml") -> List[NGContract]:
 
 
 def select_active_ng_contract(contracts: List[NGContract]) -> Optional[NGContract]:
-    """Выбираем ближайший неистёкший контракт."""
+    """
+    Выбираем активный контракт с учётом rollover.
+    Переключение на следующий контракт за 1 день до экспирации в 18:00 (вечерний клиринг).
+    """
     now = dt.datetime.now(MOEX_TZ)
-    future = [c for c in contracts if c.expiry > now]
-    if not future:
-        return None
-    future.sort(key=lambda c: c.expiry)
-    return future[0]
+    
+    # Сортируем контракты по дате экспирации
+    sorted_contracts = sorted(contracts, key=lambda c: c.expiry)
+    
+    for contract in sorted_contracts:
+        # Rollover deadline: за 1 день до экспирации в 18:00 МСК
+        rollover_time = contract.expiry - dt.timedelta(days=1)
+        rollover_time = rollover_time.replace(hour=18, minute=0, second=0, microsecond=0)
+        
+        # Если ещё не наступил rollover deadline — используем этот контракт
+        if now < rollover_time:
+            return contract
+    
+    # Если все контракты просрочены — возвращаем самый дальний (или None)
+    return sorted_contracts[-1] if sorted_contracts else None
+
 
 
 
@@ -139,7 +153,7 @@ TRADE_HISTORY_PATH = BASE_DIR / "trade_history.csv"
 CHECK_INTERVAL_SEC = 60
 
 # ========== ACTIVE CONTRACT FROM YAML ==========
-NG_CONTRACTS = load_ng_contracts("contracts.yaml")
+NG_CONTRACTS = load_ng_contracts("src/contracts.yaml")
 ACTIVE_NG_CONTRACT = select_active_ng_contract(NG_CONTRACTS)
 
 if ACTIVE_NG_CONTRACT is None:
@@ -149,7 +163,9 @@ ACTIVE_FIGI = ACTIVE_NG_CONTRACT.figi
 ACTIVE_TICKER = ACTIVE_NG_CONTRACT.code
 ACTIVE_UID = ACTIVE_NG_CONTRACT.uid
 
+print(f"🔍 DEBUG expiry: {ACTIVE_NG_CONTRACT.expiry} | ISO: {ACTIVE_NG_CONTRACT.expiry.isoformat()}")
 print(f"✅ Active contract: {ACTIVE_TICKER} | FIGI: {ACTIVE_FIGI} | Expiry: {ACTIVE_NG_CONTRACT.expiry.strftime('%Y-%m-%d')}")
+
 # ========== END ACTIVE CONTRACT ==========
 
 NEWSFILE = "news_fire.txt"
