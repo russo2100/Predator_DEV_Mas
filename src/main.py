@@ -2023,7 +2023,7 @@ async def main_loop():
                     "ATRSL": data.get("ATRSL", 0.05),
                     "ATRTP": data.get("ATRTP", 0.15),
                     "market_state": data.get(
-                        "marketstate", data.get("market_state", "RANGE")
+                    "marketstate", data.get("market_state", "RANGE")
                     ),
                 },
             )
@@ -2043,6 +2043,8 @@ async def main_loop():
             trend_h1 = trend_5m
             trend_d1 = trend_5m
 
+            ai_confidence = getattr(news_result, 'confidence', 50)
+
             market_context = {
                 "ticker": "NG",
                 "trend_5m": trend_5m,
@@ -2050,6 +2052,7 @@ async def main_loop():
                 "trend_d1": locals().get("trend_d1", trend_5m),
                 "market_state": data.get("market_state", data.get("marketstate","RANGE")),
                 "news_summary": manual_news[:500],
+                "ai_confidence": ai_confidence,
             }
           
             print("🧠 PLANNER: Синтез торговой стратегии...")
@@ -2060,7 +2063,7 @@ async def main_loop():
             market_context = {
                 "ticker": "NG",
 
-                # как было: ты ошибочно писал trend_d1/h1 = trend_5m
+               
                 "trend_5m": trend_5m,
                 "trend_h1": locals().get("trend_h1", trend_5m),
                 "trend_d1": locals().get("trend_d1", trend_5m),

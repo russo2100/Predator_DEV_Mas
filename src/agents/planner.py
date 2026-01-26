@@ -176,13 +176,23 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
         final_reason = reason
         if fundamental_note:
             final_reason = (reason + " | " + " ".join(fundamental_note)).strip()
+            
+        ai_confidence = float(market_context.get("ai_confidence", 0))
 
         # Определяем FORCE_WEIGHT на основе risk_mode
-        force_weight = 0.50  # Default для CONSERVATIVE
+        force_weight = 0.60  # Default для CONSERVATIVE
         if base_risk == "NORMAL":
-            force_weight = 0.60
-        elif base_risk == "AGGRESSIVE":
             force_weight = 0.70
+        elif base_risk == "AGGRESSIVE":
+            force_weight = 0.50
+            
+        # 🔥 BOOST для высокой уверенности AI (≥80%)
+        if ai_confidence >= 85:
+            force_weight = min(force_weight + 0.10, 0.70)  # +10%, max 0.70
+            print(f"🚀 FORCE_WEIGHT boosted: {force_weight:.2f} (AI conf: {ai_confidence}%)")
+        elif ai_confidence >= 80:
+            force_weight = min(force_weight + 0.05, 0.65)  # +5%, max 0.65
+            print(f"⬆️ FORCE_WEIGHT increased: {force_weight:.2f} (AI conf: {ai_confidence}%)")
 
         final_plan: Dict[str, Any] = {
             "bias": base_bias,
