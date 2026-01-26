@@ -2,12 +2,7 @@ ng_futures:
   base_ticker: "NG"
   market: "MOEX_FORTS"
   contracts:
-    - code: "NRF6"
-      figi: "FUTNGM012600"
-      uid: "23822ad1-37cf-430b-9eb0-43f0dbc504b1"
-      month: 1
-      year: 2026
-      expiry_date: "2026-01-28T11:05:00+03:00"
+    
     - code: "NRG6"
       figi: "FUTNGM022600"
       uid: "2e05f080-9642-44e5-931d-fc8299e4e5ac"

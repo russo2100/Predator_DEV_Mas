@@ -680,26 +680,55 @@ class MainOrderExecutor:
         """
         Возвращает dict с позицией или None, если произошла ошибка сети.
         Это защищает от открытия дублирующих позиций, если бот "ослеп".
+        
+        ВАЖНО: В редких случаях брокер может вернуть average_price = 0.0,
+        в этом случае используется текущая цена инструмента как fallback.
         """
         try:
             async with AsyncClient(self.token) as client:
                 account_id = await self._get_account_id(client)
                 portfolio = await client.operations.get_portfolio(account_id=account_id)
+                
                 for p in portfolio.positions:
                     if p.figi == figi:
                         avg = (
                             p.average_position_price.units
                             + p.average_position_price.nano / 1e9
                         )
+                        
+                        lots = int(p.quantity.units)
+                        
+                        # 🔧 FALLBACK: если avg = 0, используем current_price
+                        if avg == 0.0 and lots > 0:
+                            # Позиция есть, но цена не определена → используем текущую
+                            current = (
+                                p.current_price.units
+                                + p.current_price.nano / 1e9
+                            )
+                            if current > 0:
+                                avg = current
+                                print(f"⚠️ Broker API fallback: average_price = 0, используем current_price: {avg:.3f}")
+                            else:
+                                # Если и current_price = 0, запросим last_price
+                                last_price = await self.get_last_price(figi)
+                                if last_price and last_price > 0:
+                                    avg = last_price
+                                    print(f"⚠️ Broker API fallback: используем last_price: {avg:.3f}")
+                                else:
+                                    print(f"⚠️ КРИТИЧНО: не удалось получить цену позиции! Lots={lots}, FIGI={figi}")
+                        
                         return {
-                            "lots": int(p.quantity.units),
+                            "lots": lots,
                             "average_price": float(avg),
                         }
+                
                 # Если в цикле не нашли позицию по figi, значит ее нет
                 return {"lots": 0, "average_price": 0.0}
+                
         except Exception as e:
             print(f"⚠️ ОШИБКА СЕТИ при получении позиции: {e}")
             return None  # Возвращаем None, чтобы главный цикл знал о сбое
+
     
     
     async def get_portfolio(self) -> Dict[str, Any]:
@@ -1435,7 +1464,7 @@ def log_decision_block(
 def decide_action(
     lots: int,
     target_lots: int,
-    max_lots: int,  # Не используется — оставил для совместимости
+    max_lots: int,
     ai_signal: str,
     ai_confidence: int,
     bullish_prob: float,
@@ -1452,7 +1481,10 @@ def decide_action(
     current_price: float = 0.0,
     sl_level: float = 0.0,
     pnl_pct: float = 0.0,
+    last_sl_exit_cycle: int = -999,  
+    current_cycle: int = 0,           
 ) -> Tuple[str, str, Dict[str, Any]]:
+
     """
     v2.1 Optimized Hybrid Decision Engine — 100% эквивалентна v2.0, но быстрее.
     Убраны дубли, оптимизированы формулы, early returns.
@@ -1474,15 +1506,21 @@ def decide_action(
     
     # Trading rules (cached call)
     trading_rules = parse_trading_rules_from_news()
-    if trading_rules.get("forced_short") and lots == 0:
-        target_lots = trading_rules.get("target_lots", 2)
-        return f"SHORT{target_lots}", f"⚡ FORCED SHORT{target_lots} from news_fire.txt", metadata
     if trading_rules.get("force_buy") and lots == 0:
+        # === ЗАЩИТА ОТ FORCED BUY ПОСЛЕ НЕДАВНЕГО SL ===
+        cycles_since_sl = current_cycle - last_sl_exit_cycle if last_sl_exit_cycle >= 0 else 999
+        
+        # Блокировка 1: Недавний SL (< 5 циклов)
+        if cycles_since_sl < 5:
+            return "NOOP", f"🚫 FORCED BUY blocked: SL exit {cycles_since_sl} cycles ago", metadata
+        
+        # Блокировка 2: Падающий рынок (trend DOWN + RSI < 50)
+        if trend_5m == "DOWN" and rsi < 50:
+            return "NOOP", f"🚫 FORCED BUY blocked: trend DOWN + RSI {rsi:.1f} < 50", metadata
+        
+        # Все проверки пройдены
         return "BUY2", "⚡ FORCED BUY from news_fire.txt", metadata
-    
-    # OpenRouter error
-    if ai_signal == "NEUTRAL" and ai_confidence == 0:
-        return "NOOP", "OpenRouter lag detected - skipping cycle", metadata
+
     
     # Signal accumulation (optimized: single if per signal type)
     if ai_signal == "BUY":
@@ -1744,6 +1782,11 @@ async def main_loop():
     position_timer = PositionTimer()
     MAX_LOTS_ALLOWED = 8
     prev_lots = 0
+    # === SL COOLDOWN TRACKING ===
+    last_sl_exit_cycle = -999  # Цикл когда был последний выход по SL
+    last_sl_exit_price = 0.0   # Цена выхода по SL
+    SL_COOLDOWN_CYCLES = 5     # Минимум циклов до повторного входа после SL
+
 
     # Инициализация entry_time при старте, если позиция открыта
     try:
@@ -2042,6 +2085,7 @@ async def main_loop():
             # --- PLANNER CONTEXT SAFE DEFAULTS ---
             trend_h1 = trend_5m
             trend_d1 = trend_5m
+            
 
             ai_confidence = getattr(news_result, 'confidence', 50)
 
@@ -2236,6 +2280,8 @@ async def main_loop():
                 current_price=current_price,
                 sl_level=sharedstate.sl_level,
                 pnl_pct=pnl_pct,
+                last_sl_exit_cycle=last_sl_exit_cycle,  
+                current_cycle=cycle
             )
             
          
@@ -2364,6 +2410,21 @@ async def main_loop():
                     print(f"🚫 BLOCKED: {block_reason}")
                     action = "NOOP"
                     action_reason = f"Blocked: {block_reason}"
+                    
+                                
+                # === SL COOLDOWN CHECK ===
+                if last_sl_exit_cycle >= 0 and not is_position_reduction:
+                    cycles_since_sl = cycle - last_sl_exit_cycle
+                    
+                    if cycles_since_sl < SL_COOLDOWN_CYCLES:
+                        # Недавний выход по SL
+                        price_diff_pct = abs(current_price - last_sl_exit_price) / last_sl_exit_price * 100
+                        
+                        if price_diff_pct < 1.0:  # Цена в той же зоне (±1%)
+                            trade_allowed = False
+                            block_reason = f"SL_COOLDOWN: {cycles_since_sl}/{SL_COOLDOWN_CYCLES} cycles since SL exit @ {last_sl_exit_price:.3f}"
+                            print(f"🚫 {block_reason}")
+    
 
                
 
@@ -2382,6 +2443,13 @@ async def main_loop():
                             pos = await executor.get_position_data(ACTIVE_FIGI)
                             current_lots = int(pos.get("lots", current_lots))
                             print(f"✅ POSITION AFTER ORDER: {pos}")
+                                                        
+                            # === ЗАПОМИНАЕМ SL EXIT ===
+                            if "SL hit" in action_reason and current_lots == 0:
+                                last_sl_exit_cycle = cycle
+                                last_sl_exit_price = current_price
+                                print(f"🚨 SL EXIT записан: cycle={cycle}, price={current_price:.3f}")
+
                             print(f"DEBUG_SYNC lots_before_log: current_lots={current_lots}, pos_lots={pos.get('lots')}")
                             
                             # Инициализация Trailing Stop ПОСЛЕ успешного ордера
