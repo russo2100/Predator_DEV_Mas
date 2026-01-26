@@ -2324,10 +2324,16 @@ async def main_loop():
 
   
                 # 2) Исполнение разрешено если:
-                #    - это снижение риска (закрытие/частичное закрытие) И это реальный risk-exit, ИЛИ
-                #    - фильтры разрешили торговлю (новый вход / добор)
+                # Определяем is_risk_exit ПЕРЕД can_execute
                 is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
+
+                # КРИТИЧНО: risk exits ВСЕГДА исполняются (даже если trade_allowed=False)
                 can_execute = (is_position_reduction and is_risk_exit) or trade_allowed
+
+                # DEBUG: показать почему can_execute=True/False
+                if is_position_reduction and is_risk_exit:
+                    print(f"✅ RISK EXIT OVERRIDE: can_execute=True (reduction={is_position_reduction}, risk_exit={is_risk_exit})")
+
 
                 
                 # 3) Clearing lock: за 30 минут до клиринга запрещаем увеличивать риск (|lots|)
@@ -2405,11 +2411,16 @@ async def main_loop():
                     f"DEBUG_GATES trade_allowed={trade_allowed} "
                     f"block_reason={block_reason} action_reason={action_reason}"
                 )
-                # GWDD BLOCK: Если trade_allowed=False, блокируем исполнение
-                if not trade_allowed:
+                
+                # GWDD BLOCK: Если trade_allowed=False, блокируем исполнение (кроме risk exits!)
+                if not trade_allowed and not (is_position_reduction and is_risk_exit):
                     print(f"🚫 BLOCKED: {block_reason}")
                     action = "NOOP"
                     action_reason = f"Blocked: {block_reason}"
+                else:
+                    if is_position_reduction and is_risk_exit:
+                        print(f"✅ RISK EXIT ALLOWED despite trade_allowed=False")
+
                     
                                 
                 # === SL COOLDOWN CHECK ===
