@@ -22,13 +22,14 @@ class ATRStopState:
 class ATRStopEngine:
     """
     Движок динамического стопа по ATR с адаптацией по тренду.
-    
+
     Основные принципы:
     - При открытии позиции фиксируем entry_price, ATR_0 и trend
     - SL рассчитывается как: entry ± (ATR * k_sl)
     - k_sl зависит от тренда:
       - LONG + UPTREND: k_sl = 2.0 (шире стоп)
       - SHORT + DOWNTREND: k_sl = 2.0 (шире стоп)
+      - FLAT: k_sl = 2.5 (самый широкий стоп, защита от whipsaw)
       - Остальное: k_sl = 1.5 (стандартный стоп)
     - На каждом цикле обновляем экстремумы и trailing stop
     - Стоп двигается только в сторону уменьшения риска
@@ -43,13 +44,14 @@ class ATRStopEngine:
         """
         self.k_sl_uptrend = k_sl_uptrend
         self.k_sl_other = k_sl_other
+        self.k_sl_flat = 2.5  # Специальный множитель для FLAT (anti-whipsaw)
         self.m_be = m_be
         self.state: Optional[ATRStopState] = None
 
     def on_open(self, direction: str, entry_price: float, atr_0: float, trend: str = "FLAT") -> None:
         """
         Вызывается при открытии новой позиции.
-        
+
         direction: "LONG" или "SHORT"
         entry_price: цена входа
         atr_0: ATR на момент входа
@@ -57,25 +59,25 @@ class ATRStopEngine:
         """
         if direction not in ("LONG", "SHORT"):
             raise ValueError(f"Invalid direction for ATRStopEngine: {direction}")
-        
+
         if atr_0 <= 0:
             # Защита от мусорного ATR
-             atr_0 = 0.015 
+            atr_0 = 0.015
 
-
-        
         # Определить k_sl на основе направления и тренда
         if (direction == "LONG" and trend == "UPTREND") or (direction == "SHORT" and trend == "DOWNTREND"):
             k_sl = self.k_sl_uptrend  # 2.0 для позиций по тренду
+        elif trend == "FLAT":
+            k_sl = self.k_sl_flat  # 2.5 для FLAT (wider stop to avoid whipsaw)
         else:
             k_sl = self.k_sl_other  # 1.5 для остальных
-        
+
         # Рассчитать initial SL
         if direction == "LONG":
             sl0 = entry_price - k_sl * atr_0
         else:  # SHORT
             sl0 = entry_price + k_sl * atr_0
-        
+
         # Минимальный offset (1% от entry)
         min_offset = entry_price * 0.01
         if direction == "LONG":
@@ -84,7 +86,7 @@ class ATRStopEngine:
         else:  # SHORT
             if (sl0 - entry_price) < min_offset:
                 sl0 = entry_price + min_offset
-        
+
         self.state = ATRStopState(
             entry_price=entry_price,
             atr_at_entry=atr_0,
@@ -94,7 +96,7 @@ class ATRStopEngine:
             direction=direction,
             trend=trend,
         )
-        
+
         # DEBUG вывод
         offset = abs(entry_price - sl0)
         print(
@@ -114,7 +116,7 @@ class ATRStopEngine:
         """
         Вызывается на каждом цикле, пока позиция открыта.
         Обновляет p_high/p_low, trailing SL и безубыток.
-        
+
         price_t: текущая цена
         atr_t: текущий ATR
         trend: текущий тренд (может меняться)
@@ -134,6 +136,8 @@ class ATRStopEngine:
         # Определить k_sl на основе текущего тренда
         if (s.direction == "LONG" and s.trend == "UPTREND") or (s.direction == "SHORT" and s.trend == "DOWNTREND"):
             k_sl = self.k_sl_uptrend
+        elif s.trend == "FLAT":
+            k_sl = self.k_sl_flat  # 2.5 для FLAT
         else:
             k_sl = self.k_sl_other
 
@@ -153,7 +157,7 @@ class ATRStopEngine:
             profit = price_t - s.entry_price
             if profit >= self.m_be * s.atr_at_entry:
                 sl_new = max(sl_new, s.entry_price)
-            
+
             # Если SL поднялся, вывести в лог
             if sl_new > s.sl_level:
                 profit_pct = (price_t - s.entry_price) / s.entry_price * 100
@@ -171,7 +175,7 @@ class ATRStopEngine:
             profit = s.entry_price - price_t
             if profit >= self.m_be * s.atr_at_entry:
                 sl_new = min(sl_new, s.entry_price)
-            
+
             # Если SL снизился, вывести в лог
             if sl_new < s.sl_level:
                 profit_pct = (s.entry_price - price_t) / s.entry_price * 100

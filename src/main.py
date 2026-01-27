@@ -107,8 +107,8 @@ def get_market_status():
     weekday = now.weekday()  # 0=Mon, 6=Sun, 5=Sat
     
     # Воскресенье - закрыто
-    #if weekday == 6:
-    #    return False, "Воскресенье: рынок закрыт"
+    if weekday == 6:
+        return False, "Воскресенье: рынок закрыт"
     
     # Суббота: торги 09:50 - 23:50 (на час позже)
     if weekday == 5:
@@ -194,7 +194,7 @@ last_sleep_log_time: Optional[dt.datetime] = None
 
 # ========== SESSION ID & JSONL ==========
 session_id = str(uuid.uuid4())[:8]
-jsonl_path = f"shadow_agents_log_{dt.datetime.now().strftime('%Y%m%d')}.jsonl"
+jsonl_path = f"data/decisions_{dt.datetime.now().strftime('%Y%m%d')}.jsonl"
 
 
 async def runshadowanalysisnonblocking(shadowadapter, marketdata, posdata, bias, signal, confidence, reason):
@@ -816,7 +816,7 @@ class MainOrderExecutor:
                         "payment_value": op.payment.units + op.payment.nano / 1e9,
                         "commission_value": (
                             op.commission.units + op.commission.nano / 1e9
-                        ) if op.commission else 0.0,
+                        ) if hasattr(op, "commission") and op.commission else 0.0,
                         "quantity": op.quantity,
                         "price_value": (
                             op.price.units + op.price.nano / 1e9
@@ -975,7 +975,7 @@ class LLMMarketAnalystAdapter:
         key = settings.OPENROUTER_API_KEY.get_secret_value()
         self.llm = ChatOpenAI(
             model=settings.AI_MODEL_ANALYST,
-            temperature=0,  # Строгость ответов
+            temperature=0.5,  # Строгость ответов
             api_key=key,  # type: ignore
             base_url=settings.OPENROUTER_BASE_URL,
             model_kwargs={"response_format": {"type": "json_object"}},
@@ -1372,12 +1372,12 @@ def log_decision_block(
     action: str,
     reason: str,
     pnl_pct: float = 0.0,
-    forced_entry: bool = False,  # ← НОВЫЙ ПАРАМЕТР
-    consecutive_signals: int = 0,  # ← Сколько BUY подряд
-    avg_confidence: float = 0.0  # ← Средняя уверенность
+    forced_entry: bool = False,
+    consecutive_signals: int = 0,
+    avg_confidence: float = 0.0
 ):
     """
-    Выводит блок принятия решения в консоль и записывает его в shadow_agents_log.jsonl.
+    Выводит блок принятия решения в консоль и записывает его в shadow_agents_log_{date}.jsonl.
     """
     import json
     from datetime import datetime
@@ -1392,9 +1392,7 @@ def log_decision_block(
     print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
     print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
 
-
-
-    # ← НОВЫЙ ВЫВОД для форсированных входов
+    # НОВЫЙ ВЫВОД для форсированных входов
     if forced_entry:
         print(f"🚨 FORCED ENTRY: {consecutive_signals} consecutive BUY (avg Conf {avg_confidence:.1f}%)")
 
@@ -1403,14 +1401,14 @@ def log_decision_block(
     if rules.get('min_sell_price'):
         print(f"🔴 MIN_SELL: {rules['min_sell_price']:.3f}")
 
-    emoji_map = {"BUY": "🚀", "SELLALL": "💥", "SELLALL": "⚖️", "NOOP": "😴", "BUY1": "🎯", "SELL1": "🎯", "BUYALL": "💪", "BUYALL": "⚡"}
+    emoji_map = {"BUY": "🚀", "SELLALL": "💥", "NOOP": "😴", "BUY1": "🎯", "SELL1": "🎯", "BUYALL": "💪"}
     emoji = emoji_map.get(action, "🔍")
     print(f"➡️ ACTION: {emoji} {action}")
     if reason:
         print(f"📝 Reason: {reason}")
     print("="*70 + "\n")
 
-    # 2. Формируем лог-запись
+    # 2. Формируем лог-запись (правильный формат как на локальной машине)
     log_entry = {
         "timestamp": datetime.now(pytz.timezone("Europe/Moscow")).isoformat(),
         "cycle": cycle,
@@ -1419,10 +1417,11 @@ def log_decision_block(
             "rsi": rsi,
             "trend": trend,
             "lots": lots,
-            "pnl_pct": pnl_pct,
             "holding_hours": holding_hours,
             "minutes_to_clearing": minutes_to_clearing,
-            "bias": bias
+            "bias": bias,
+            "unrealized_pnl_pct": pnl_pct,  # ← ИСПРАВЛЕНО: было pnl_pct
+            "unrealized_pnl_pct_missing": False  # ← ДОБАВЛЕНО
         },
         "decision": {
             "ai_signal": ai_signal,
@@ -1430,24 +1429,24 @@ def log_decision_block(
             "action": action,
             "reason": reason,
             "rules": rules,
-            "forced_entry": forced_entry,  # ← НОВОЕ ПОЛЕ
-            "consecutive_signals": consecutive_signals,  # ← Счётчик BUY
-            "avg_confidence": avg_confidence  # ← Средняя уверенность
+            "forced_entry": forced_entry,
+            "consecutive_signals": consecutive_signals,
+            "avg_confidence": avg_confidence
         }
     }
 
-    # 3. Запись в файл (без обогащения, т.к. это sync функция)
-    # Обогащение произойдёт в main_loop асинхронно
+    # 3. Запись в файл (с датой в имени)
     try:
-        log_file = Path("shadow_agents_log.jsonl")
-        log_file.touch(exist_ok=True)
+        # Используем глобальную переменную jsonl_path (строка 197)
+        log_file = Path(jsonl_path)
+        print(f"🔍 DEBUG: Writing to {log_file.absolute()} (exists: {log_file.exists()})")
         
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
             f.flush()
         
     except PermissionError as e:
-        print(f"⚠️ WARN: No write permission to shadow_agents_log.jsonl: {e}")
+        print(f"⚠️ WARN: No write permission to {jsonl_path}: {e}")
     except OSError as e:
         print(f"⚠️ WARN: OS error writing log: {e}")
     except Exception as e:
@@ -1455,6 +1454,7 @@ def log_decision_block(
     
     # Возвращаем log_entry для дальнейшего обогащения в main_loop
     return log_entry
+
 
 
 
@@ -1481,159 +1481,206 @@ def decide_action(
     current_price: float = 0.0,
     sl_level: float = 0.0,
     pnl_pct: float = 0.0,
-    last_sl_exit_cycle: int = -999,  
-    current_cycle: int = 0,           
+    last_sl_exit_cycle: int = -999,
+    current_cycle: int = 0,
 ) -> Tuple[str, str, Dict[str, Any]]:
+    """
+    Hybrid Decision Engine v2.1 (patched ordering):
+    - Risk exits (TP/SL/Emergency/Clearing) evaluated BEFORE any HOLD/NOOP locks.
+    - metadata includes is_risk_exit flag for executor override.
+    """
 
-    """
-    v2.1 Optimized Hybrid Decision Engine — 100% эквивалентна v2.0, но быстрее.
-    Убраны дубли, оптимизированы формулы, early returns.
-    """
     global consecutive_buy_signals, buy_signals_history, consecutive_sell_signals, sell_signals_history
-    
-    metadata = {"forced_entry": False, "consecutive_signals": 0, "avg_confidence": 0.0}
-    
-    # Adaptive threshold (optimized: ternary)
-    adaptive_threshold = 70 if atr > 0.15 else 60 if atr < 0.10 else 65
-    
-    # Early guards
-    clearing_block = minutes_to_clearing <= 30
-    if clearing_block:
-        return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min)", metadata
-    
+
+    metadata: Dict[str, Any] = {
+        "forced_entry": False,
+        "consecutive_signals": 0,
+        "avg_confidence": 0.0,
+        "is_risk_exit": False,
+    }
+
+    # Normalize inputs
+    ai_signal_u = str(ai_signal).upper().strip()
+    trend_u = str(trend_5m).upper().strip()
+    market_state_u = str(market_state).upper().strip()
+
+    # ---------- 0) RISK EXITS FIRST (always win) ----------
+    # 0.1 Take Profit
+    if lots != 0 and pnl_pct >= 10.0:
+        metadata["is_risk_exit"] = True
+        side = "SELLALL" if lots > 0 else "BUYALL"
+        return side, f"✅ TP PnL{pnl_pct:.2f}% ≥10%", metadata
+
+    # 0.2 ATR Stop
+    if lots != 0 and sl_level > 0.01 and current_price is not None:
+        sl_hit = (lots > 0 and current_price <= sl_level) or (lots < 0 and current_price >= sl_level)
+        if sl_hit:
+            metadata["is_risk_exit"] = True
+            side = "SELLALL" if lots > 0 else "BUYALL"
+            return side, f"ATR SL hit price{current_price:.3f} SL{sl_level:.3f}", metadata
+
+    # 0.3 Emergency exits (keep your logic, but only when position exists)
+    # NOTE: these are risk exits too
+    is_extreme = any(word in str(rules).lower() for word in ["vortex", "extreme", "arctic", "noaa"])
+    effective_confidence = ai_confidence + (20 if is_extreme else 0)
+
+    if lots > 0:
+        if bearish_prob > 0.65 or (ai_signal_u == "SELL" and effective_confidence > 80):
+            metadata["is_risk_exit"] = True
+            return "SELLALL", f"Emergency Bear {bearish_prob:.2f}", metadata
+        if bullish_prob < 0.40 and rsi > 70:
+            metadata["is_risk_exit"] = True
+            return "SELLALL", "Partial TP bull weakening", metadata
+
+    if lots < 0:
+        if bullish_prob > 0.65 or (ai_signal_u == "BUY" and effective_confidence > 80):
+            metadata["is_risk_exit"] = True
+            return "BUYALL", f"Emergency Bull {bullish_prob:.2f}", metadata
+        if bearish_prob < 0.40 and rsi < 30:
+            metadata["is_risk_exit"] = True
+            return "BUYALL", "Partial TP bear weakening", metadata
+
+    # 0.4 Clearing protection (ENTRIES blocked, but risk exits above are allowed)
+    if minutes_to_clearing <= 10:
+        # If flat (no position) — do nothing
+        if lots == 0:
+            return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min)", metadata
+        # If in position — we already handled exits above; keep position
+        return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min): hold position", metadata
+
+    # ---------- 1) Target delta bookkeeping ----------
     delta = target_lots - lots
     metadata.update({"delta": delta, "target_lots": target_lots, "current_lots": lots})
-    
-    # Trading rules (cached call)
+
+    # ---------- 2) FORCE BUY from news_fire (only if flat; with SL cooldown guards) ----------
     trading_rules = parse_trading_rules_from_news()
     if trading_rules.get("force_buy") and lots == 0:
-        # === ЗАЩИТА ОТ FORCED BUY ПОСЛЕ НЕДАВНЕГО SL ===
         cycles_since_sl = current_cycle - last_sl_exit_cycle if last_sl_exit_cycle >= 0 else 999
-        
-        # Блокировка 1: Недавний SL (< 5 циклов)
+
         if cycles_since_sl < 5:
             return "NOOP", f"🚫 FORCED BUY blocked: SL exit {cycles_since_sl} cycles ago", metadata
-        
-        # Блокировка 2: Падающий рынок (trend DOWN + RSI < 50)
-        if trend_5m == "DOWN" and rsi < 50:
+
+        if trend_u == "DOWN" and rsi < 50:
             return "NOOP", f"🚫 FORCED BUY blocked: trend DOWN + RSI {rsi:.1f} < 50", metadata
-        
-        # Все проверки пройдены
+
+        metadata["forced_entry"] = True
         return "BUY2", "⚡ FORCED BUY from news_fire.txt", metadata
 
-    
-    # Signal accumulation (optimized: single if per signal type)
-    if ai_signal == "BUY":
+    # ---------- 3) Signal accumulation (for forced entry) ----------
+    if ai_signal_u == "BUY":
         consecutive_buy_signals += 1
         buy_signals_history.append(ai_confidence)
-        if len(buy_signals_history) > 5: buy_signals_history.pop(0)
+        if len(buy_signals_history) > 5:
+            buy_signals_history.pop(0)
     else:
         consecutive_buy_signals = 0
         buy_signals_history.clear()
-    
-    if ai_signal == "SELL":
+
+    if ai_signal_u == "SELL":
         consecutive_sell_signals += 1
         sell_signals_history.append(ai_confidence)
-        if len(sell_signals_history) > 5: sell_signals_history.pop(0)
-    elif ai_signal != "BUY":
+        if len(sell_signals_history) > 5:
+            sell_signals_history.pop(0)
+    elif ai_signal_u != "BUY":
         consecutive_sell_signals = 0
         sell_signals_history.clear()
-    
-    # Forced entry BUY (optimized: sum[-3:] direct)
-    if (consecutive_buy_signals >= 3 and len(buy_signals_history) >= 3 and lots == 0):
-        avg_conf = sum(buy_signals_history[-3:]) / 3
-        volume_confirmed = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
-        if (avg_conf >= adaptive_threshold and rsi < 75 and bullish_prob > 0.55 and volume_confirmed):
-            metadata.update({"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf})
-            return "BUY1", f"🚨 FORCED ENTRY: 3 BUY (thr {adaptive_threshold}%, avg {avg_conf:.1f}%) RSI {rsi:.1f}", metadata
-    
-    # Forced entry SELL
-    if (consecutive_sell_signals >= 3 and len(sell_signals_history) >= 3 and lots == 0):
-        avg_conf_sell = sum(sell_signals_history[-3:]) / 3
-        volume_confirmed_sell = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
-        if (avg_conf_sell >= adaptive_threshold and rsi > 25 and bearish_prob > 0.55 and volume_confirmed_sell):
-            metadata.update({"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell})
-            return "SELL1", f"🚨 FORCED SHORT: 3 SELL (thr {adaptive_threshold}%, avg {avg_conf_sell:.1f}%) RSI {rsi:.1f}", metadata
-    
-    # Confidence & hedge (inline optimized)
-    is_extreme = any(word in str(rules).lower() for word in ["vortex", "extreme", "arctic", "noaa"])
-    effective_confidence = ai_confidence + (20 if is_extreme else 0)
-    min_entry_conf = 40 if is_extreme else 70
-    is_bullish_hedge = (bias == "bearish" and bullish_prob > 0.30)
-    is_bearish_hedge = (bias == "bullish" and bearish_prob > 0.30)
-    
-    # Entry logic (grouped by lots==0)
+
+    # Adaptive threshold
+    adaptive_threshold = 70 if atr > 0.15 else 60 if atr < 0.10 else 65
+
+    # ---------- 4) Forced entry BUY / SELL (flat only) ----------
     if lots == 0:
-        market_state_u = str(market_state).upper().strip()
-        if (ai_signal == "HOLD" and ai_confidence >= 65 and bullish_prob >= 0.40 and 
-            rsi <= 80 and market_state_u in ("IMPULSE_UP", "UP")):
+        # Forced BUY after 3 consistent BUY signals
+        if consecutive_buy_signals >= 3 and len(buy_signals_history) >= 3:
+            avg_conf = sum(buy_signals_history[-3:]) / 3
+            volume_confirmed = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
+
+            if avg_conf >= adaptive_threshold and rsi < 75 and bullish_prob > 0.55 and volume_confirmed:
+                metadata.update(
+                    {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
+                )
+                return "BUY1", f"🚨 FORCED ENTRY: 3 BUY (thr {adaptive_threshold}%, avg {avg_conf:.1f}%) RSI {rsi:.1f}", metadata
+
+        # Forced SELL after 3 consistent SELL signals
+        if consecutive_sell_signals >= 3 and len(sell_signals_history) >= 3:
+            avg_conf_sell = sum(sell_signals_history[-3:]) / 3
+            volume_confirmed_sell = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
+
+            if avg_conf_sell >= adaptive_threshold and rsi > 25 and bearish_prob > 0.55 and volume_confirmed_sell:
+                metadata.update(
+                    {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
+                )
+                return "SELL1", f"🚨 FORCED SHORT: 3 SELL (thr {adaptive_threshold}%, avg {avg_conf_sell:.1f}%) RSI {rsi:.1f}", metadata
+
+    # ---------- 5) Entry logic (flat only) ----------
+    min_entry_conf = 40 if is_extreme else 70
+    is_bullish_hedge = (str(bias).lower() == "bearish" and bullish_prob > 0.30)
+    is_bearish_hedge = (str(bias).lower() == "bullish" and bearish_prob > 0.30)
+
+    if lots == 0:
+        # Small test-entry on HOLD only in impulse up (optional, kept from your version)
+        if (
+            ai_signal_u == "HOLD"
+            and ai_confidence >= 65
+            and bullish_prob >= 0.40
+            and rsi <= 80
+            and market_state_u in ("IMPULSE_UP", "UP", "IMPULSEUP")
+        ):
             return "BUY1", f"TEST ENTRY HOLD+Conf{ai_confidence} Bull{bullish_prob:.2f} RSI{rsi:.1f}", metadata
-        
-        if ai_signal == "BUY" and effective_confidence >= min_entry_conf:
+
+        if ai_signal_u == "BUY" and effective_confidence >= min_entry_conf:
             return "BUY1", f"Entry Conf{effective_confidence} Bullish{bullish_prob:.2f}", metadata
+
         if is_bullish_hedge and rsi < 40:
             return "BUY1", f"Hedge Long Prob{bullish_prob:.2f} vs Bias{bias}", metadata
-        
-        if ai_signal == "SELL" and effective_confidence >= min_entry_conf:
+
+        if ai_signal_u == "SELL" and effective_confidence >= min_entry_conf:
             return "SELL1", f"Entry Conf{effective_confidence} Bearish{bearish_prob:.2f}", metadata
+
         if is_bearish_hedge and rsi > 60:
             return "SELL1", f"Hedge Short Prob{bearish_prob:.2f} vs Bias{bias}", metadata
-    
-    # TP/SL/Extreme (early grouped)
-    if pnl_pct >= 10.0:
-        return ("SELLALL" if lots > 0 else "BUYALL"), f"✅ TP PnL{pnl_pct:.2f}% ≥10%", metadata
-    
-    if sl_level > 0.01 and current_price is not None:
-        if (lots > 0 and current_price <= sl_level) or (lots < 0 and current_price >= sl_level):
-            side = "SELLALL" if lots > 0 else "BUYALL"
-            return side, f"ATR SL hit price{current_price:.3f} SL{sl_level:.3f}", metadata
-    
-    # Extreme oversold block/rebalance
-    if rsi < 20 and lots > 0 and ai_signal == "SELL":
-        return "NOOP", f"Block SELLALL RSI{rsi:.1f}<20 oversold", metadata
-    if lots > 0 and (bearish_prob > 0.65 or (ai_signal == "SELL" and effective_confidence > 80)):
-        return "SELLALL", f"Emergency Bear {bearish_prob:.2f}", metadata
-    if lots > 0 and bullish_prob < 0.40 and rsi > 70:
-        return "SELLALL", "Partial TP bull weakening", metadata
-    
-    if lots < 0 and (bullish_prob > 0.65 or (ai_signal == "BUY" and effective_confidence > 80)):
-        return "BUYALL", f"Emergency Bull {bullish_prob:.2f}", metadata
-    if lots < 0 and bearish_prob < 0.40 and rsi < 30:
-        return "BUYALL", "Partial TP bear weakening", metadata
-    
-    # Extreme RSI mean reversion (grouped)
-    if lots == 0:
-        if (rsi < 20 and bullish_prob > 0.15 and ai_signal != "SELL") or \
-           (rsi < 20 and bias == "bearish" and bullish_prob > 0.25 and ai_signal != "SELL"):
+
+        # Mean reversion (flat only)
+        if (rsi < 20 and bullish_prob > 0.15 and ai_signal_u != "SELL") or (
+            rsi < 20 and str(bias).lower() == "bearish" and bullish_prob > 0.25 and ai_signal_u != "SELL"
+        ):
             return "BUY1", f"🚨 OVERSOLD RSI{rsi:.1f} Bull{bullish_prob:.2f}", metadata
-        if rsi > 80 and bearish_prob > 0.15 and ai_signal != "BUY":
+
+        if rsi > 80 and bearish_prob > 0.15 and ai_signal_u != "BUY":
             return "SELL1", f"🚨 OVERBOUGHT RSI{rsi:.1f} Bear{bearish_prob:.2f}", metadata
-    
-    # Gap rule
-    if (trend_5m == "IMPULSE_UP" and lots == 0 and current_price and 
-        5.28 <= current_price <= 5.36 and 72 <= rsi <= 76 and ai_signal == "HOLD"):
-        return "BUY2", "⚡ IMMEDIATE Gap consolidation BUY2", metadata
-    
-    # HOLD enforcement
-    if ai_signal == "HOLD" and lots == 0:
-        return "NOOP", "🔒 HOLD: wait conviction", metadata
 
-    # HOLD with position...
-    if ai_signal == "HOLD" and lots != 0:
-        return "NOOP", f"🔒 HOLD: keep position (lots={lots})", metadata
+        # Gap rule (kept)
+        if (
+            trend_u == "IMPULSE_UP"
+            and current_price
+            and 5.28 <= current_price <= 5.36
+            and 72 <= rsi <= 76
+            and ai_signal_u == "HOLD"
+        ):
+            return "BUY2", "⚡ IMMEDIATE Gap consolidation BUY2", metadata
 
-    # RECOMPUTE delta after all target_lots adjustments
+    # ---------- 6) HOLD enforcement LAST (so it never blocks SL/TP) ----------
+    # Секция 0 УЖЕ обработала все risk-exits (TP/SL/Emergency/Clearing)
+    # Если код дошёл сюда — это НЕ risk-exit
+
+    if ai_signal_u == "HOLD":
+        # Если в позиции — держим (delta уже = 0 из секции 7)
+        if lots != 0:
+            return "NOOP", f"HOLD keep position (lots={lots})", metadata
+        # Если флэт — блокируем вход
+        else:
+            return "NOOP", "HOLD wait conviction", metadata
+
+    # ---------- 7) Final delta-driven rebalance ----------
+    # Recompute delta (in case something changed upstream)
     delta = target_lots - lots
     metadata.update({"delta": delta, "target_lots": target_lots, "current_lots": lots})
 
-    # Final delta-driven
     if delta > 0:
         return f"BUY{abs(delta)}", f"GWDD Target{target_lots} cur{lots} BUY{abs(delta)}", metadata
     if delta < 0:
         return f"SELL{abs(delta)}", f"GWDD Target{target_lots} cur{lots} SELL{abs(delta)}", metadata
 
-
-    
     return "NOOP", f"Aligned {lots}={target_lots} B{bullish_prob:.2f}S{bearish_prob:.2f}RSI{rsi:.1f}", metadata
 
 
@@ -1691,7 +1738,7 @@ class ExecutionCooldownState:
     lastexecutiontime: Dict[Tuple[str, str], float] = field(default_factory=dict)
     lastconfirmedlots: Optional[int] = None
     globallockuntil: float = 0.0
-    COOLDOWNDURATION: float = 120.0  # Per-signal
+    COOLDOWNDURATION: float = 60.0  # Per-signal
     GLOBALLOCKDURATION: float = 30.0  # BUYALL/SELLALL
 
     def hash_reason(self, reason: str) -> str:
@@ -1785,18 +1832,28 @@ async def main_loop():
     # === SL COOLDOWN TRACKING ===
     last_sl_exit_cycle = -999  # Цикл когда был последний выход по SL
     last_sl_exit_price = 0.0   # Цена выхода по SL
-    SL_COOLDOWN_CYCLES = 5     # Минимум циклов до повторного входа после SL
+    SL_COOLDOWN_CYCLES = 10     # Минимум циклов до повторного входа после SL
 
 
+    
     # Инициализация entry_time при старте, если позиция открыта
     try:
         pos = await get_position_data_safe(executor, ACTIVE_FIGI, retries=3)
         start_lots = int(pos.get("lots", 0))
         if start_lots > 0 and sharedstate.entry_time is None:
-            sharedstate.entry_time = time_module.time()
-            print(f"⏰ Позиция {start_lots} лот при старте, entry_time установлен")
+            # Пытаемся восстановить из истории
+            entry_dt = load_last_entry_time_from_history(ACTIVE_FIGI)
+            
+            if entry_dt:
+                sharedstate.entry_time = entry_dt.timestamp()
+                holding_hours = (time_module.time() - sharedstate.entry_time) / 3600
+                print(f"⏰ Восстановлено из истории: позиция {start_lots} лот удерживается {holding_hours:.1f}ч")
+            else:
+                sharedstate.entry_time = time_module.time()
+                print(f"⏰ История не найдена, entry_time установлен на текущее время")
     except Exception as e:
         print(f"⚠️ Ошибка init entry_time: {e}")
+
 
 
     while True:
@@ -2283,6 +2340,11 @@ async def main_loop():
                 last_sl_exit_cycle=last_sl_exit_cycle,  
                 current_cycle=cycle
             )
+            # ========== RISK-EXIT OVERRIDE (BEFORE any gates) ==========
+            is_risk_exit = decision_metadata.get("is_risk_exit", False)
+            if is_risk_exit:
+                can_execute = True
+                print(f"✅ RISK EXIT OVERRIDE: can_execute=True (reason={action_reason})")
             
          
 	
@@ -2290,25 +2352,10 @@ async def main_loop():
             sleeping_market = (trend_5m == "FLAT")
 
             if sleeping_market and isinstance(action_reason, str) and action_reason.startswith("GWDD Target"):
-                # Вариант B: блокируем только ребаланс GWDD Target в сонном рынке.
-                # Аварийные выходы не должны начинаться с "GWDD Target", но оставим страховку.
-                risk_exit_markers = (
-                    "Clearing protection",
-                    "Clearing lock",
-                    "ATR SL",
-                    "SL hit",
-                    "STOP",
-                    "Emergency",
-                    "HOLD de-risk",
-                    "FORCED",
-                )
-                is_risk_exit = any(m in action_reason for m in risk_exit_markers)
-
-                if not is_risk_exit:
-                    print(f"😴 SLEEPING MARKET: blocked {action} | {action_reason}")
-                    action = "NOOP"
-                    action_reason = f"SLEEPING MARKET: blocked {action_reason}"
-            # --- END SLEEPING MARKET GATE ---
+                print(f"😴 SLEEPING MARKET: blocked {action} | {action_reason}")
+                action = "NOOP"
+                action_reason = f"SLEEPING MARKET: blocked {action_reason}"
+           
 
             
             # Разделяем ИСПОЛНЕНИЕ на управление позицией и новые входы
@@ -2321,11 +2368,14 @@ async def main_loop():
                     (direction == "SELL" and current_lots > 0) or
                     (direction == "BUY" and current_lots < 0)
                 )
+                # Explicitly mark SELLALL/BUYALL as reduction when position exists
+                if action in ("BUYALL", "SELLALL") and current_lots != 0:
+                    is_position_reduction = True
 
   
                 # 2) Исполнение разрешено если:
                 # Определяем is_risk_exit ПЕРЕД can_execute
-                is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
+                # is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
 
                 # КРИТИЧНО: risk exits ВСЕГДА исполняются (даже если trade_allowed=False)
                 can_execute = (is_position_reduction and is_risk_exit) or trade_allowed
@@ -2338,7 +2388,7 @@ async def main_loop():
                 
                 # 3) Clearing lock: за 30 минут до клиринга запрещаем увеличивать риск (|lots|)
                 minutes_to_clearing = get_minutes_to_clearing()
-                if minutes_to_clearing <= 30:
+                if minutes_to_clearing <= 10 and not is_risk_exit:
                     # Разрешаем только снижение позиции/закрытие, даже если trade_allowed=True
                     if not is_position_reduction and action not in ("BUYALL", "SELLALL"):
                         can_execute = False
@@ -2386,9 +2436,10 @@ async def main_loop():
                     print(skip_reason)
                     continue  # Пропуск цикла!
 
-                # Record success ДОЛЖЕН БЫТЬ после post_order_guarded success
+                # ========== EXTRACT is_risk_exit FROM METADATA (BEFORE execution block) ==========
+                is_risk_exit = decision_metadata.get("is_risk_exit", False)
 
-                can_execute = bool(is_position_reduction or trade_allowed)
+                
                 if action == "NOOP":
                     can_execute = False
                     qty = 0
@@ -2402,7 +2453,7 @@ async def main_loop():
                 )
 
                 print(
-                    f"DEBUG_EXEC cycle={cycle} action={action} dir={direction} qty={qty} "
+#                     f"DEBUG_EXEC cycle={cycle} action={action} dir={direction} qty={qty} "
                     f"lots={current_lots} can={can_execute} allowed={trade_allowed} "
                     f"reduct={is_position_reduction} why={why_block}"
                 )
@@ -2419,7 +2470,7 @@ async def main_loop():
                     action_reason = f"Blocked: {block_reason}"
                 else:
                     if is_position_reduction and is_risk_exit:
-                        print(f"✅ RISK EXIT ALLOWED despite trade_allowed=False")
+                        pass
 
                     
                                 
@@ -2460,6 +2511,17 @@ async def main_loop():
                                 last_sl_exit_cycle = cycle
                                 last_sl_exit_price = current_price
                                 print(f"🚨 SL EXIT записан: cycle={cycle}, price={current_price:.3f}")
+                            # === LOG TRADE TO HISTORY ===
+                            await log_trade(
+                                action="CLOSE_LONG" if prev_lots > 0 else "CLOSE_SHORT",
+                                figi=ACTIVE_FIGI,
+                                lots_before=prev_lots,
+                                lots_after=current_lots,
+                                price=current_price,
+                                signal=news_result.signal,
+                                confidence=news_result.confidence,
+                                reason=action_reason
+                            )    
 
                             print(f"DEBUG_SYNC lots_before_log: current_lots={current_lots}, pos_lots={pos.get('lots')}")
                             

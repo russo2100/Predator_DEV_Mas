@@ -152,7 +152,7 @@ class GWDDEngine:
             total_weight *= max(0.7, 1 + geopolitical_impact)  # Don't go below 0.7
         
         # 9. Global minimum weight (unchanged)
-        total_weight = max(self.config.global_min_weight, total_weight)
+        total_weight = max(0.0, total_weight)
         
         # 10. Cap at 1.0
         total_weight = min(1.0, total_weight)
@@ -301,8 +301,8 @@ class GWDDEngine:
             momentum = 0.0
         
         # HOLD signal - no entry
-        if ai_signal == "HOLD":
-            return False, float(entry_weight), f"HOLD signal, weight={entry_weight:.2f}"
+        #if ai_signal == "HOLD":
+        #    return False, float(entry_weight), f"HOLD signal, weight={entry_weight:.2f}"
         
         # GWDD v2: Блокировка при резком падении веса (momentum < -0.05)
         if momentum < -0.05:
