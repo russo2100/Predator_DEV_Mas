@@ -23,10 +23,11 @@ class PlannerAgent:
             temperature=0.1,
             api_key=settings.OPENROUTER_API_KEY,
             base_url=settings.OPENROUTER_BASE_URL,
-            timeout=30,  # ← ДОБАВИТЬ
-            request_timeout=30,  # ← ДОБАВИТЬ (для старых версий langchain)
+            timeout=30,
+            request_timeout=30,
             model_kwargs={"response_format": {"type": "json_object"}},
         )
+
     # ---- Совместимость с ShadowAdapter ----
     def createplan(self, agent_state: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -39,7 +40,9 @@ class PlannerAgent:
             "trend_5m": agent_state.get("trend_5m", agent_state.get("trend5m", "UNKNOWN")),
             "market_state": agent_state.get("market_state", agent_state.get("marketstate", "UNKNOWN")),
             "news_summary": agent_state.get("newssummary", agent_state.get("news_summary", "")),
+            "ai_confidence": agent_state.get("ai_confidence", 0),
         }
+
         return self.create_daily_plan(market_context)
 
     def create_plan(self, market_context: Dict[str, Any]) -> Dict[str, Any]:
@@ -52,19 +55,32 @@ class PlannerAgent:
         """
         raw_news = str(market_context.get("news_summary", "") or "")
 
-        # --- 0) Trend override (детерминированный) ---
+        # --- 0) ИНИЦИАЛИЗАЦИЯ плана с дефолтными значениями ---
+        plan: Dict[str, Any] = {
+            "bias": "NEUTRAL",
+            "risk_mode": "CONSERVATIVE",
+            "reason": "Initial plan",
+            "trend_htf": "NEUTRAL",
+            "trend_override_reason": "",
+            "force_weight": 0.60,
+        }
+
+        # --- 1) Trend override (детерминированный) ---
         # Цель: стабилизировать bias под текущий тренд/состояние рынка,
         # чтобы не было "паралича" при IMPULSE_UP.
         trend_5m = str(market_context.get("trend_5m", "UNKNOWN")).upper()
         market_state = str(market_context.get("market_state", "UNKNOWN")).upper()
-
         trend_bias = "NEUTRAL"
+
         if market_state in ("IMPULSE_UP", "IMPULSEUP") or trend_5m in ("IMPULSE_UP", "UPTREND", "UP"):
             trend_bias = "BULLISH"
         elif market_state in ("IMPULSE_DOWN", "IMPULSEDOWN") or trend_5m in ("IMPULSE_DOWN", "DOWNTREND", "DOWN"):
             trend_bias = "BEARISH"
 
-        # --- 1) Фундаментальные флаги из news_summary ---
+        plan["trend_htf"] = trend_bias  # BULLISH / BEARISH / NEUTRAL
+        plan["trend_override_reason"] = ""
+
+        # --- 2) Фундаментальные флаги из news_summary ---
         arctic_score = 0.0
         storage_type = "UNKNOWN"
 
@@ -79,8 +95,9 @@ class PlannerAgent:
         if m_storage:
             storage_type = m_storage.group(1).capitalize()
 
-        # --- 2) Сезон по UTC-месяцу ---
+        # --- 3) Сезон по UTC-месяцу ---
         month = datetime.datetime.utcnow().month
+
         if month in (12, 1, 2):
             season = "WINTER"
         elif month in (3, 4, 5, 10, 11):
@@ -88,7 +105,7 @@ class PlannerAgent:
         else:
             season = "SUMMER"
 
-        # --- 3) Базовый LLM-план ---
+        # --- 4) Базовый LLM-план ---
         template = """
 SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда.
 Твоя задача - определить глобальное направление торговли на сегодня.
@@ -107,14 +124,14 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
 3. Если новости и фундамент сильно медвежьи -> избегать агрессивных BUY.
 
 Верни строго валидный JSON (без Markdown, без пояснений):
+
 {{
   "bias": "NEUTRAL",
   "risk_mode": "CONSERVATIVE",
-  "reason": "Стратегическое обоснование (RU)",
-  "allowed_bias": ["LONG_ONLY", "SHORT_ONLY", "NEUTRAL", "NO_TRADE"],
-  "allowed_risk_mode": ["AGGRESSIVE", "NORMAL", "CONSERVATIVE"]
+  "reason": "Стратегическое обоснование (RU)"
 }}
-        """.strip()
+""".strip()
+
 
         prompt = ChatPromptTemplate.from_template(template)
         chain = prompt | self.llm
@@ -130,29 +147,34 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
 
         try:
             response = chain.invoke(input_data)
-            plan = json.loads(self._clean_json_string(str(response.content)))
+            llm_plan = json.loads(self._clean_json_string(str(response.content)))
+
+            # Обновляем plan значениями от LLM
+            plan["bias"] = str(llm_plan.get("bias", "NEUTRAL")).upper()
+            plan["risk_mode"] = str(llm_plan.get("risk_mode", "CONSERVATIVE")).upper()
+            plan["reason"] = str(llm_plan.get("reason", "LLM response") or "LLM response")
+
         except Exception as e:
             print(f"⚠️ Ошибка Planner (LLM): {e}")
-            plan = {
-                "bias": "NEUTRAL",
-                "risk_mode": "CONSERVATIVE",
-                "reason": "Ошибка AI в базовом плане",
-            }
+            # plan уже инициализирован с дефолтами, продолжаем
 
-        base_bias = str(plan.get("bias", "NEUTRAL"))
-        base_risk = str(plan.get("risk_mode", "CONSERVATIVE"))
-        reason = str(plan.get("reason", "") or "")
+        base_bias = plan["bias"]
+        base_risk = plan["risk_mode"]
+        reason = plan["reason"]
 
-        # --- 3.5) Применяем Trend override как первичный bias ---
+        # --- 5) Применяем Trend override как первичный bias ---
         # Переводим BULLISH/BEARISH в доступные режимы bias движка (LONG_ONLY/SHORT_ONLY).
         if trend_bias == "BULLISH":
             base_bias = "LONG_ONLY"
+            plan["trend_override_reason"] = "IMPULSE_UP/UPTREND -> LONG_ONLY"
             reason = (reason + " | Trend override: IMPULSE_UP/UPTREND -> LONG_ONLY.").strip(" |")
+
         elif trend_bias == "BEARISH":
             base_bias = "SHORT_ONLY"
+            plan["trend_override_reason"] = "IMPULSE_DOWN/DOWNTREND -> SHORT_ONLY"
             reason = (reason + " | Trend override: IMPULSE_DOWN/DOWNTREND -> SHORT_ONLY.").strip(" |")
 
-        # --- 4) Фундаментальный слой ---
+        # --- 6) Фундаментальный слой ---
         fundamental_note: list[str] = []
 
         if season == "WINTER" and arctic_score > 0.6 and storage_type == "Draw":
@@ -176,16 +198,17 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
         final_reason = reason
         if fundamental_note:
             final_reason = (reason + " | " + " ".join(fundamental_note)).strip()
-            
+
         ai_confidence = float(market_context.get("ai_confidence", 0))
 
-        # Определяем FORCE_WEIGHT на основе risk_mode
+        # --- 7) Определяем FORCE_WEIGHT на основе risk_mode ---
         force_weight = 0.60  # Default для CONSERVATIVE
+
         if base_risk == "NORMAL":
             force_weight = 0.70
         elif base_risk == "AGGRESSIVE":
             force_weight = 0.50
-            
+
         # 🔥 BOOST для высокой уверенности AI (≥80%)
         if ai_confidence >= 85:
             force_weight = min(force_weight + 0.10, 0.70)  # +10%, max 0.70
@@ -194,20 +217,31 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
             force_weight = min(force_weight + 0.05, 0.65)  # +5%, max 0.65
             print(f"⬆️ FORCE_WEIGHT increased: {force_weight:.2f} (AI conf: {ai_confidence}%)")
 
+        # --- 8) Финальный план с полной инициализацией ---
         final_plan: Dict[str, Any] = {
             "bias": base_bias,
             "risk_mode": base_risk,
             "reason": final_reason,
             "signal": base_bias,
-            "force_weight": force_weight,  # ← ДОБАВИТЬ
+            "force_weight": force_weight,
+            "trend_htf": plan["trend_htf"],
+            "trend_override_reason": plan["trend_override_reason"],
         }
 
-
         print(f"📜 [Planner] Стратегия на сессию: {final_plan['bias']} ({final_plan['risk_mode']})")
+        if final_plan["trend_override_reason"]:
+            print(f"🧭 Trend HTF: {final_plan['trend_htf']} | Reason: {final_plan['trend_override_reason']}")
+
         return final_plan
 
     @staticmethod
     def _clean_json_string(text: str) -> str:
         text = text.strip()
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        return m.group(0) if m else text
+        # Удаляем markdown code fences если есть
+        text = text.replace("```json", "").replace("```", "").strip()
+        # Ищем JSON между { и }
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1:
+            return text[start:end+1]
+        return text

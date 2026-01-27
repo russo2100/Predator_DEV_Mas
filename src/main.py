@@ -147,8 +147,7 @@ Action = Literal[
 
 # agent_v1/src/main.py -> agent_v1
 BASE_DIR = Path(__file__).resolve().parent.parent
-TRADE_HISTORY_PATH = BASE_DIR / "trade_history.csv"
-
+TRADE_HISTORY_PATH = BASE_DIR / "data" / "trade_history.csv"
 
 CHECK_INTERVAL_SEC = 60
 
@@ -1363,18 +1362,18 @@ def log_decision_block(
     rsi: float,
     trend: str,
     lots: int,
+    pnl_pct: float,
     holding_hours: float,
     ai_signal: str,
-    ai_confidence: float,
+    ai_confidence: int,
     bias: str,
-    minutes_to_clearing: int,
-    rules: dict,
     action: str,
     reason: str,
-    pnl_pct: float = 0.0,
+    rules: dict,
+    minutes_to_clearing: int = 999,
     forced_entry: bool = False,
     consecutive_signals: int = 0,
-    avg_confidence: float = 0.0
+    avg_confidence: float = 0.0,
 ):
     """
     Выводит блок принятия решения в консоль и записывает его в shadow_agents_log_{date}.jsonl.
@@ -1383,77 +1382,78 @@ def log_decision_block(
     from datetime import datetime
     import pytz
     from pathlib import Path
-
+    
+    # Безопасное извлечение из rules
+    trend_htf = str(rules.get("trend_htf", "N/A")).upper() if rules else "N/A"
+    trend_override_reason = str(rules.get("trend_override_reason", "")) if rules else ""
+    
+    # Типизация
+    ai_signal = str(ai_signal).upper()
+    bias = str(bias).upper()
+    action = str(action)
+    reason = str(reason)
+    
     # 1. Визуальный вывод в консоль
     print("\n" + "="*70)
     print(f"📊 DECISION BLOCK | Cycle: {cycle} | {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%H:%M:%S')}")
     print("-" * 70)
-    print(f"💰 Price: {price:.3f} | RSI: {rsi:.1f} | Trend: {trend}")
+    print(f"💰 Price: {price:.3f} | RSI: {rsi:.1f} | Trend LTF: {trend} | Trend HTF: {trend_htf}")
     print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
-    print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias.upper()}")
-
+    print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias}")
+    
+    if trend_override_reason:
+        print(f"🧭 Trend override: {trend_override_reason}")
+    
+    print(f"➡️ ACTION: {action}")
+    print(f"📝 Reason: {reason}")
+    
     # НОВЫЙ ВЫВОД для форсированных входов
     if forced_entry:
-        print(f"🚨 FORCED ENTRY: {consecutive_signals} consecutive BUY (avg Conf {avg_confidence:.1f}%)")
-
-    if rules.get('max_buy_price'):
-        print(f"🟢 MAX_BUY: {rules['max_buy_price']:.3f}")
-    if rules.get('min_sell_price'):
-        print(f"🔴 MIN_SELL: {rules['min_sell_price']:.3f}")
-
-    emoji_map = {"BUY": "🚀", "SELLALL": "💥", "NOOP": "😴", "BUY1": "🎯", "SELL1": "🎯", "BUYALL": "💪"}
-    emoji = emoji_map.get(action, "🔍")
-    print(f"➡️ ACTION: {emoji} {action}")
-    if reason:
-        print(f"📝 Reason: {reason}")
-    print("="*70 + "\n")
-
-    # 2. Формируем лог-запись (правильный формат как на локальной машине)
+        print(f"🚨 FORCED ENTRY: {consecutive_signals} consecutive signals (avg Conf {avg_confidence:.1f}%)")
+    
+    print("="*70)
+    
+    # 2. JSONL запись
     log_entry = {
-        "timestamp": datetime.now(pytz.timezone("Europe/Moscow")).isoformat(),
         "cycle": cycle,
-        "input_state": {
-            "price": price,
-            "rsi": rsi,
-            "trend": trend,
-            "lots": lots,
-            "holding_hours": holding_hours,
-            "minutes_to_clearing": minutes_to_clearing,
-            "bias": bias,
-            "unrealized_pnl_pct": pnl_pct,  # ← ИСПРАВЛЕНО: было pnl_pct
-            "unrealized_pnl_pct_missing": False  # ← ДОБАВЛЕНО
-        },
-        "decision": {
-            "ai_signal": ai_signal,
-            "ai_confidence": ai_confidence,
-            "action": action,
-            "reason": reason,
-            "rules": rules,
-            "forced_entry": forced_entry,
-            "consecutive_signals": consecutive_signals,
-            "avg_confidence": avg_confidence
-        }
+        "timestamp": datetime.now(pytz.timezone('Europe/Moscow')).isoformat(),
+        "price": price,
+        "rsi": rsi,
+        "trend_ltf": trend,
+        "trend_htf": trend_htf,
+        "trend_override": trend_override_reason,
+        "lots": lots,
+        "pnl_pct": pnl_pct,
+        "holding_hours": holding_hours,
+        "ai_signal": ai_signal,
+        "ai_confidence": ai_confidence,
+        "bias": bias,
+        "action": action,
+        "reason": reason,
+        "minutes_to_clearing": minutes_to_clearing,
+        "forced_entry": forced_entry,
+        "consecutive_signals": consecutive_signals,
+        "avg_confidence": avg_confidence,
     }
-
-    # 3. Запись в файл (с датой в имени)
+    
+    # 3. Запись в JSONL (дефолтный путь без LOGS_DIR)
     try:
-        # Используем глобальную переменную jsonl_path (строка 197)
-        log_file = Path(jsonl_path)
-        print(f"🔍 DEBUG: Writing to {log_file.absolute()} (exists: {log_file.exists()})")
+        # Используем текущую директорию или 'logs'
+        log_dir = Path("logs")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        log_file = log_dir / f"shadow_agents_log_{datetime.now(pytz.timezone('Europe/Moscow')).strftime('%Y%m%d')}.jsonl"
         
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
             f.flush()
         
-    except PermissionError as e:
-        print(f"⚠️ WARN: No write permission to {jsonl_path}: {e}")
-    except OSError as e:
-        print(f"⚠️ WARN: OS error writing log: {e}")
     except Exception as e:
-        print(f"⚠️ WARN: Unexpected error in logging: {type(e).__name__}: {e}")
+        print(f"⚠️ WARN: Error writing to log: {type(e).__name__}: {e}")
     
-    # Возвращаем log_entry для дальнейшего обогащения в main_loop
+    # 4. Возвращаем log_entry для дальнейшего обогащения
     return log_entry
+
 
 
 
@@ -1484,13 +1484,17 @@ def decide_action(
     last_sl_exit_cycle: int = -999,
     current_cycle: int = 0,
 ) -> Tuple[str, str, Dict[str, Any]]:
+        
     """
     Hybrid Decision Engine v2.1 (patched ordering):
     - Risk exits (TP/SL/Emergency/Clearing) evaluated BEFORE any HOLD/NOOP locks.
     - metadata includes is_risk_exit flag for executor override.
     """
+    
 
     global consecutive_buy_signals, buy_signals_history, consecutive_sell_signals, sell_signals_history
+    
+    
 
     metadata: Dict[str, Any] = {
         "forced_entry": False,
@@ -1658,6 +1662,8 @@ def decide_action(
             and ai_signal_u == "HOLD"
         ):
             return "BUY2", "⚡ IMMEDIATE Gap consolidation BUY2", metadata
+        
+    
 
     # ---------- 6) HOLD enforcement LAST (so it never blocks SL/TP) ----------
     # Секция 0 УЖЕ обработала все risk-exits (TP/SL/Emergency/Clearing)
@@ -1682,6 +1688,7 @@ def decide_action(
         return f"SELL{abs(delta)}", f"GWDD Target{target_lots} cur{lots} SELL{abs(delta)}", metadata
 
     return "NOOP", f"Aligned {lots}={target_lots} B{bullish_prob:.2f}S{bearish_prob:.2f}RSI{rsi:.1f}", metadata
+
 
 
 
@@ -2261,9 +2268,9 @@ async def main_loop():
                
                 # Override weight если задан FORCE_WEIGHT из Planner
                 planner_force_weight = plan_result.get("force_weight")
-                if planner_force_weight is not None:
-                    entry_weight = planner_force_weight
-                    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight}")
+                #if planner_force_weight is not None:
+                #    entry_weight = planner_force_weight
+                #    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight}")
 
 
                 should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
@@ -2299,9 +2306,29 @@ async def main_loop():
             
 
             # GWDD может перекрыть решение risk_agent
-            if not should_enter and news_result.signal in ["BUY", "SELL"]:
+            if not should_enter and news_result.signal in ["BUY", "SELL", "HOLD"]:
+
                 trade_allowed = False
                 block_reason = f"GWDD_BLOCK: {gwdd_reason}"
+                
+            # GWDD может перекрыть решение risk_agent
+            if not should_enter and news_result.signal in ["BUY", "SELL", "HOLD"]:
+
+                trade_allowed = False
+                block_reason = f"GWDD_BLOCK: {gwdd_reason}"
+
+
+            # Если уже в позиции, GWDD Lots=0 (SKIP) не должен обнулять target -> держим текущие лоты
+            if current_lots != 0 and position_size == 0:
+                position_size = abs(current_lots)
+
+            
+            
+            # ⚡ GWDD: target_lots зависит от ai_signal (SELL = SHORT, отрицательный)
+            if news_result.signal == "SELL":
+                target_lots_signed = -position_size  # SHORT: отрицательные лоты
+            else:
+                target_lots_signed = position_size   # LONG: положительные лоты
 
 
             # Если уже в позиции, GWDD Lots=0 (SKIP) не должен обнулять target -> держим текущие лоты
