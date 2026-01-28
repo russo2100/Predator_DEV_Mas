@@ -151,11 +151,11 @@ class RiskAgent:
                 verdict["risk_score"] = 65
                 return verdict
 
-            if side == "SHORT" and rsi <= self.RSI_OVERSOLD:
-                verdict["allowed"] = False
-                verdict["reason"] = f"RSI Oversold: block SHORT (rsi={rsi:.2f} <= {self.RSI_OVERSOLD:.2f})"
-                verdict["risk_score"] = 65
-                return verdict
+            #if side == "SHORT" and rsi <= self.RSI_OVERSOLD:
+            #    verdict["allowed"] = False
+            #   verdict["reason"] = f"RSI Oversold: block SHORT (rsi={rsi:.2f} <= {self.RSI_OVERSOLD:.2f})"
+            #    verdict["risk_score"] = 65
+            #    return verdict
 
             # 2.4 Всё ОК
             verdict["allowed"] = True

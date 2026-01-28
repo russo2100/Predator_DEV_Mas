@@ -1507,13 +1507,70 @@ def decide_action(
     ai_signal_u = str(ai_signal).upper().strip()
     trend_u = str(trend_5m).upper().strip()
     market_state_u = str(market_state).upper().strip()
+    
+    
+            # ---------- RSI GATE (context-aware) ----------
+    # Dynamic RSI thresholds based on trend context.
+    trend_htf = str(rules.get("trend_htf", "NA")).upper() if rules else "NA"
+    
+    # Determine SHORT threshold
+    if trend_htf == "BEARISH":
+        rsi_threshold_short = 25  # aggressive in confirmed downtrend
+    elif trend_u in ("FLAT", "RANGE") and trend_htf in ("NEUTRAL", "NA"):
+        rsi_threshold_short = 30  # conservative in sideways
+    else:
+        rsi_threshold_short = 30  # default
+    
+    # Determine LONG threshold (symmetric)
+    if trend_htf == "BULLISH":
+        rsi_threshold_long = 75  # aggressive in confirmed uptrend
+    elif trend_u in ("FLAT", "RANGE") and trend_htf in ("NEUTRAL", "NA"):
+        rsi_threshold_long = 70  # conservative in sideways
+    else:
+        rsi_threshold_long = 70  # default
+    
+        # Apply gates (entry only, any trend)
+    if lots == 0:
+        if ai_signal_u == "BUY" and rsi >= rsi_threshold_long:
+            return "NOOP", f"🚫 RSI GATE: BLOCK BUY, RSI {rsi:.1f}>={rsi_threshold_long} (trend_LTF={trend_u}, HTF={trend_htf}, state={market_state_u})", metadata
+        if ai_signal_u == "SELL" and rsi <= rsi_threshold_short:
+            return "NOOP", f"🚫 RSI GATE: BLOCK SELL, RSI {rsi:.1f}<={rsi_threshold_short} (trend_LTF={trend_u}, HTF={trend_htf}, state={market_state_u})", metadata
+
+        
+        
+        # ---------- POST-SL COOLDOWN ----------
+    # Block re-entry in same direction shortly after SL exit.
+    if lots == 0 and last_sl_exit_cycle >= 0:
+        cycles_since_sl = current_cycle - last_sl_exit_cycle
+        
+        # Determine cooldown based on confidence
+        if ai_confidence < 70:
+            cooldown_cycles = 15  # 15 minutes
+        elif ai_confidence <= 70-85:
+            cooldown_cycles = 8  # 8 minutes
+        else:
+            cooldown_cycles = 3   # 3 minutes
+        
+        if cycles_since_sl < cooldown_cycles and ai_signal_u in ("BUY", "SELL"):
+            return "NOOP", f"🚫 COOLDOWN: SL exit {cycles_since_sl}/{cooldown_cycles} cycles ago, sig={ai_signal_u} conf={ai_confidence}", metadata
+
+
 
     # ---------- 0) RISK EXITS FIRST (always win) ----------
-    # 0.1 Take Profit
+        # 0.1 Take Profit (multi-level)
+    # TP1: partial close at +1.0% (50% position or 1 lot)
+    if lots != 0 and pnl_pct >= 1.0 and abs(lots) >= 2:
+        metadata["is_risk_exit"] = True
+        close_qty = 1
+        side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
+        return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.0%, partial close {close_qty} lot", metadata
+    
+    # TP2: full exit at +10.0%
     if lots != 0 and pnl_pct >= 10.0:
         metadata["is_risk_exit"] = True
         side = "SELLALL" if lots > 0 else "BUYALL"
-        return side, f"✅ TP PnL{pnl_pct:.2f}% ≥10%", metadata
+        return side, f"✅ TP2 PnL{pnl_pct:.2f}% ≥10%, full exit", metadata
+
 
     # 0.2 ATR Stop
     if lots != 0 and sl_level > 0.01 and current_price is not None:
@@ -2264,14 +2321,11 @@ async def main_loop():
                     news_text=full_context,
                 )
                 
-                
-               
                 # Override weight если задан FORCE_WEIGHT из Planner
                 planner_force_weight = plan_result.get("force_weight")
-                #if planner_force_weight is not None:
-                #    entry_weight = planner_force_weight
-                #    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight}")
-
+                if planner_force_weight is not None:
+                    entry_weight = planner_force_weight
+                    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight:.3f}")
 
                 should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
                     entry_weight=entry_weight,
@@ -2287,8 +2341,6 @@ async def main_loop():
                     rsi=rsi_val,
                 )
 
-                
-
             except Exception as e:
                 print(f"⚠️ GWDD ERROR: {e}")
                 entry_weight = 0.5
@@ -2296,54 +2348,74 @@ async def main_loop():
                 should_enter = False
                 gwdd_reason = f"Error: {e}"
 
-            
             print(f"⚖️ GWDD Weight: {entry_weight:.3f} | Lots: {position_size}")
             print(f"   {gwdd_reason}")
             
             # Обновляем shared_state
             sharedstate.gwdd_weight = entry_weight
             sharedstate.suggested_lots = position_size
-            
 
-            # GWDD может перекрыть решение risk_agent
-            if not should_enter and news_result.signal in ["BUY", "SELL", "HOLD"]:
+            # --- AI-OVERRIDE LAYER: даём ИИ право на малый вход, даже если GWDD блокирует ---
+            ai_hard_buy = (
+                news_result.signal == "BUY"
+                and news_result.confidence >= 85
+                and news_result.bullish_prob >= 75
+                and rsi_val >= 70
+                and data.get("market_state", "RANGE") in ("IMPULSE_UP", "RANGE")
+            )
 
+            ai_hard_sell = (
+                news_result.signal == "SELL"
+                and news_result.confidence >= 85
+                and news_result.bearish_prob >= 75
+                and rsi_val <= 30
+                and data.get("market_state", "RANGE") in ("IMPULSE_DOWN", "RANGE")
+            )
+
+            ai_override = False
+            ai_override_direction = None
+            ai_override_lots = 0
+
+            if current_lots == 0 and not should_enter:
+                if ai_hard_buy and final_bias in ("NEUTRAL", "LONG_ONLY", "BULLISH"):
+                    ai_override = True
+                    ai_override_direction = "BUY"
+                    ai_override_lots = 1
+                elif ai_hard_sell and final_bias in ("NEUTRAL", "SHORT_ONLY", "BEARISH"):
+                    ai_override = True
+                    ai_override_direction = "SELL"
+                    ai_override_lots = 1
+
+            if ai_override:
+                print(
+                    f"🤖 AI-OVERRIDE: {ai_override_direction} {ai_override_lots} lot "
+                    f"(Conf={news_result.confidence}%, "
+                    f"Bull={news_result.bullish_prob:.0f}% / Bear={news_result.bearish_prob:.0f}%, "
+                    f"RSI={rsi_val:.1f})"
+                )
+                entry_weight = max(entry_weight, 0.50)
+                weight_final = entry_weight
+                should_enter = True
+                position_size = ai_override_lots
+                gwdd_reason = gwdd_reason + " | AI-OVERRIDE: test 1 lot allowed on strong signal"
+
+            # --- Блокировка торговли (только если НЕ override) ---
+            if not should_enter and news_result.signal in ["BUY", "SELL"] and not ai_override:
                 trade_allowed = False
                 block_reason = f"GWDD_BLOCK: {gwdd_reason}"
-                
-            # GWDD может перекрыть решение risk_agent
-            if not should_enter and news_result.signal in ["BUY", "SELL", "HOLD"]:
 
-                trade_allowed = False
-                block_reason = f"GWDD_BLOCK: {gwdd_reason}"
-
-
-            # Если уже в позиции, GWDD Lots=0 (SKIP) не должен обнулять target -> держим текущие лоты
+            # --- Если уже в позиции, GWDD Lots=0 (SKIP) не должен обнулять target ---
             if current_lots != 0 and position_size == 0:
                 position_size = abs(current_lots)
 
-            
-            
-            # ⚡ GWDD: target_lots зависит от ai_signal (SELL = SHORT, отрицательный)
+            # --- Вычисляем target_lots в зависимости от сигнала ---
             if news_result.signal == "SELL":
                 target_lots_signed = -position_size  # SHORT: отрицательные лоты
             else:
                 target_lots_signed = position_size   # LONG: положительные лоты
 
-
-            # Если уже в позиции, GWDD Lots=0 (SKIP) не должен обнулять target -> держим текущие лоты
-            if current_lots != 0 and position_size == 0:
-                position_size = abs(current_lots)
-
-            
-            
-            # ⚡ GWDD: target_lots зависит от ai_signal (SELL = SHORT, отрицательный)
-            if news_result.signal == "SELL":
-                target_lots_signed = -position_size  # SHORT: отрицательные лоты
-            else:
-                target_lots_signed = position_size   # LONG: положительные лоты
-            
             # 9. DECISION_BLOCK
+
             action, action_reason, decision_metadata = decide_action(
                 lots=current_lots,
                 target_lots=target_lots_signed,
@@ -2575,7 +2647,6 @@ async def main_loop():
 
                 else:
                     why_block = block_reason or risk_verdict.get("reason", "Blocked by filter")
-                    print(f"🚫 BLOCKED: {why_block}")
 
 
 
