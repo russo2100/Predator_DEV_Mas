@@ -373,52 +373,63 @@ class GWDDEngine:
     def get_position_sizing(
         self,
         entry_weight: float,
-        max_lots: int = 8,
+        max_lots: int = 10,  # ← новый default
         risk_mode: str = "MODERATE",
         rsi: float | None = None
     ) -> int:
         """
         Calculate position size based on entry weight and risk mode
-        Preserves existing logic with added global min weight check
+        NEW: Scales linearly from 5 to 10 lots based on weight ranges
         """
-        
         # Global minimum weight check
         if entry_weight < self.config.global_min_weight:
             return 0
-            
-        lots = max(1, int(max_lots * 0.25))
-        mode = risk_mode or "MODERATE".upper()
-        
-        # CONSERVATIVE mode
+
+        mode = (risk_mode or "MODERATE").upper()
+
+        # ==================== CONSERVATIVE MODE ====================
         if mode == "CONSERVATIVE":
-            if entry_weight < self.config.min_weight_conservative:
-                lots = max(1, int(max_lots * 0.25))
-            elif entry_weight >= 0.80:
-                lots = 1
-            else:
-                lots = min(2, max_lots)
-                
-        # AGGRESSIVE mode
+            if entry_weight < self.config.min_weight_conservative:  # < 0.60
+                return 0  # No entry
+            elif entry_weight < 0.65:
+                return 5  # Scout entry: 5 lots
+            elif entry_weight < 0.75:
+                return 6  # Moderate conviction
+            elif entry_weight < 0.85:
+                return 8  # High conviction
+            else:  # >= 0.85
+                return 10  # Maximum conviction
+
+        # ==================== AGGRESSIVE MODE ====================
         elif mode == "AGGRESSIVE":
-            if entry_weight < self.config.min_weight_aggressive:
-                lots = max(1, int(max_lots * 0.25))
-            elif entry_weight >= 0.60:
-                lots = min(2, max_lots)
-            else:
-                lots = min(4, max_lots)
-                
-        # MODERATE mode (unchanged)
+            if entry_weight < self.config.min_weight_aggressive:  # < 0.45
+                return 0  # No entry
+            elif entry_weight < 0.55:
+                return 5  # Scout
+            elif entry_weight < 0.70:
+                return 6
+            elif entry_weight < 0.85:
+                return 8
+            else:  # >= 0.85
+                return 10
+
+        # ==================== MODERATE MODE ====================
         else:  # MODERATE
-            if entry_weight < self.config.min_weight_moderate:
-                lots = max(1, int(max_lots * 0.25))
-            elif entry_weight >= 0.70:
-                # RSI >= 85: only scout position
+            if entry_weight < self.config.min_weight_moderate:  # < 0.50
+                return 0  # No entry
+            elif entry_weight < 0.60:
+                return 5  # Scout
+            elif entry_weight < 0.70:
+                # RSI >= 85: extreme overbought, reduce size
                 if rsi is not None and rsi >= 85:
-                    lots = max(1, int(max_lots * 0.25))
-                else:
-                    lots = min(3, max_lots)
-            else:
-                # 1 lot for moderate scout
-                lots = 1
-                
-        return int(lots)
+                    return 5  # Keep scout size
+                return 6
+            elif entry_weight < 0.80:
+                if rsi is not None and rsi >= 85:
+                    return 6  # Reduce from 8
+                return 8
+            else:  # >= 0.80
+                if rsi is not None and rsi >= 85:
+                    return 8  # Reduce from 10
+                return 10
+

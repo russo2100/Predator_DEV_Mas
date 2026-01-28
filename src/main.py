@@ -295,7 +295,7 @@ class TrailingStopManager:
         atr: float,
         trend: str = "FLAT",
         atr_multiplier_uptrend: float = 2.0,   # ← УВЕЛИЧЕНО (было 1.2)
-        atr_multiplier_other: float = 1.5,     # ← УВЕЛИЧЕНО (было 0.8)
+        atr_multiplier_other: float = 2.5,     # ← УВЕЛИЧЕНО (было 0.8)
     ):
         self.entry_price = entry_price
         self.atr = atr
@@ -394,7 +394,7 @@ class TrailingStopManagerShort:
         atr: float,
         trend: str = "FLAT",
         atrmultiplierdowntrend: float = 2.0,  # ← УВЕЛИЧЕНО
-        atrmultiplierother: float = 1.5,       # ← УВЕЛИЧЕНО
+        atrmultiplierother: float = 2.5,       # ← УВЕЛИЧЕНО
     ):
         self.entryprice = entryprice
         self.atr = atr
@@ -1558,18 +1558,35 @@ def decide_action(
 
     # ---------- 0) RISK EXITS FIRST (always win) ----------
         # 0.1 Take Profit (multi-level)
-    # TP1: partial close at +1.0% (50% position or 1 lot)
-    if lots != 0 and pnl_pct >= 1.0 and abs(lots) >= 2:
+        # 0.1 Take Profit (3-level system: 1.5% / 3% / 5%)
+    # TP1: partial close at +1.5% (50% position)
+    if lots != 0 and pnl_pct >= 1.5:
         metadata["is_risk_exit"] = True
-        close_qty = 1
-        side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
-        return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.0%, partial close {close_qty} lot", metadata
+        
+        # If position >= 2 lots: close 50% (1 lot)
+        if abs(lots) >= 2:
+            close_qty = 1
+            side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
+            return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.5%, partial close {close_qty} lot (50%)", metadata
+        
+        # If position = 1 lot: keep for TP2 (don't close at TP1)
+        # Fall through to check TP2/TP3
     
-    # TP2: full exit at +10.0%
-    if lots != 0 and pnl_pct >= 10.0:
+    # TP2: partial close at +3.0% (close remaining 1 lot or full exit)
+    if lots != 0 and pnl_pct >= 3.0:
+        metadata["is_risk_exit"] = True
+        
+        # If 1 lot remaining: close 100%
+        if abs(lots) == 1:
+            side = "SELLALL" if lots > 0 else "BUYALL"
+            return side, f"✅ TP2 PnL{pnl_pct:.2f}% ≥3.0%, full exit (1 lot)", metadata
+    
+    # TP3: full exit at +5.0% (for trending days)
+    if lots != 0 and pnl_pct >= 5.0:
         metadata["is_risk_exit"] = True
         side = "SELLALL" if lots > 0 else "BUYALL"
-        return side, f"✅ TP2 PnL{pnl_pct:.2f}% ≥10%, full exit", metadata
+        return side, f"✅ TP3 PnL{pnl_pct:.2f}% ≥5.0%, full exit (strong trend)", metadata
+
 
 
     # 0.2 ATR Stop
@@ -1582,24 +1599,33 @@ def decide_action(
 
     # 0.3 Emergency exits (keep your logic, but only when position exists)
     # NOTE: these are risk exits too
+        # 0.3 Emergency exits (only when position exists)
+    # NOTE: these are risk exits too
     is_extreme = any(word in str(rules).lower() for word in ["vortex", "extreme", "arctic", "noaa"])
     effective_confidence = ai_confidence + (20 if is_extreme else 0)
 
     if lots > 0:
+        # Emergency exit on strong bearish reversal (ANY PnL)
         if bearish_prob > 0.65 or (ai_signal_u == "SELL" and effective_confidence > 80):
             metadata["is_risk_exit"] = True
             return "SELLALL", f"Emergency Bear {bearish_prob:.2f}", metadata
-        if bullish_prob < 0.40 and rsi > 70:
+        
+        # Partial TP when bullish momentum weakens (ONLY if profitable)
+        if bullish_prob < 0.40 and rsi > 70 and pnl_pct > 0.5:
             metadata["is_risk_exit"] = True
-            return "SELLALL", "Partial TP bull weakening", metadata
+            return "SELLALL", f"Partial TP bull weakening (PnL {pnl_pct:.2f}%)", metadata
 
     if lots < 0:
+        # Emergency exit on strong bullish reversal (ANY PnL)
         if bullish_prob > 0.65 or (ai_signal_u == "BUY" and effective_confidence > 80):
             metadata["is_risk_exit"] = True
             return "BUYALL", f"Emergency Bull {bullish_prob:.2f}", metadata
-        if bearish_prob < 0.40 and rsi < 30:
+        
+        # Partial TP when bearish momentum weakens (ONLY if profitable)
+        if bearish_prob < 0.40 and rsi < 30 and pnl_pct > 0.5:
             metadata["is_risk_exit"] = True
-            return "BUYALL", "Partial TP bear weakening", metadata
+            return "BUYALL", f"Partial TP bear weakening (PnL {pnl_pct:.2f}%)", metadata
+
 
     # 0.4 Clearing protection (ENTRIES blocked, but risk exits above are allowed)
     if minutes_to_clearing <= 10:
