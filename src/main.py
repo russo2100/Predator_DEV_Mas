@@ -170,13 +170,16 @@ print(f"✅ Active contract: {ACTIVE_TICKER} | FIGI: {ACTIVE_FIGI} | Expiry: {AC
 NEWSFILE = "news_fire.txt"
 
 # Максимальный размер позиции в лотах (только LONG)
-MAX_LOTS = 3
+MAX_LOTS = 10
 
 # ========== КОНСТАНТЫ КОМИССИЙ И ПРОФИТА ==========
 COMMISSION_PER_TRADE = 0.39  # руб за операцию (вход или выход)
-MIN_PROFIT_PCT = 0.35  # минимальный профит с учётом комиссий
+MIN_PROFIT_PCT = 0.40  # минимальный профит с учётом комиссий
 COOLDOWN_AFTER_LOSS_MINUTES = 15  # охлаждение после убыточной сделки
 COOLDOWN_AFTER_PROFIT_MINUTES = 0  # нет охлаждения после прибыли
+# GWDD state for decide_action scaling
+GWDD_TARGET_LOTS = 1
+GWDD_WEIGHT = 0.0
 
 # ========== ГЛОБАЛЬНЫЕ ПЕРЕМЕННЫЕ ==========
 last_trade_time = None
@@ -219,20 +222,24 @@ async def runshadowanalysisnonblocking(shadowadapter, marketdata, posdata, bias,
 
 # ✅ НОВАЯ ФУНКЦИЯ (добавь в начало main.py)
 async def get_position_data_safe(executor, figi: str, retries: int = 3) -> dict:
-    """Безопасное получение позиции с повторными попытками"""
     for attempt in range(retries):
         try:
             pos = await executor.get_position_data(figi)
             if pos is not None and pos.get("lots") is not None:
                 return pos
         except Exception as e:
-            print(f"⚠️ Попытка {attempt + 1}/{retries}: {e}")
-        
-        if attempt < retries - 1:
-            await asyncio.sleep(2 ** attempt)
+            print(f"⚠️ get_position_data attempt {attempt+1}/{retries}: {e}")
+            if attempt < retries - 1:
+                await asyncio.sleep(2 ** attempt)
     
-    print(f"❌ Не удалось получить позицию после {retries} попыток. Считаем: 0 лотов")
-    return {"lots": 0, "average_price": 0.0, "current_price": 0.0, "expected_yield": 0.0}
+    print(f"❌ Failed after {retries} retries. Using fallback.")
+    return {
+        "lots": 0,
+        "average_price": 0.0,
+        "current_price": 0.0,
+        "expected_yield": 0.0  # ✅ Убедись что это поле есть
+    }
+
 
 class PositionTimer:
     """
@@ -682,6 +689,9 @@ class MainOrderExecutor:
         
         ВАЖНО: В редких случаях брокер может вернуть average_price = 0.0,
         в этом случае используется текущая цена инструмента как fallback.
+        
+        КРИТИЧНО: expected_yield — это вариационная маржа от расчётной цены (settlement),
+        используется для правильного расчёта PnL в фьючерсах.
         """
         try:
             async with AsyncClient(self.token) as client:
@@ -696,6 +706,12 @@ class MainOrderExecutor:
                         )
                         
                         lots = int(p.quantity.units)
+                        
+                        # Извлекаем expected_yield (вариационная маржа в рублях)
+                        expected_yield = (
+                            p.expected_yield.units
+                            + p.expected_yield.nano / 1e9
+                        )
                         
                         # 🔧 FALLBACK: если avg = 0, используем current_price
                         if avg == 0.0 and lots > 0:
@@ -719,10 +735,11 @@ class MainOrderExecutor:
                         return {
                             "lots": lots,
                             "average_price": float(avg),
+                            "expected_yield": float(expected_yield)  # ✅ Вариационная маржа
                         }
                 
                 # Если в цикле не нашли позицию по figi, значит ее нет
-                return {"lots": 0, "average_price": 0.0}
+                return {"lots": 0, "average_price": 0.0, "expected_yield": 0.0}
                 
         except Exception as e:
             print(f"⚠️ ОШИБКА СЕТИ при получении позиции: {e}")
@@ -974,7 +991,7 @@ class LLMMarketAnalystAdapter:
         key = settings.OPENROUTER_API_KEY.get_secret_value()
         self.llm = ChatOpenAI(
             model=settings.AI_MODEL_ANALYST,
-            temperature=0.5,  # Строгость ответов
+            temperature=0.0,  # Строгость ответов
             api_key=key,  # type: ignore
             base_url=settings.OPENROUTER_BASE_URL,
             model_kwargs={"response_format": {"type": "json_object"}},
@@ -1226,34 +1243,27 @@ def parse_trading_rules_from_news() -> dict:
 
 def load_last_entry_time_from_history(figi: str) -> Optional[datetime]:
     """
-    Читает trade_history.csv и пытается восстановить время входа в текущую позицию.
-
-    Логика:
-    - Берём последнюю строку, где:
-      - figi совпадает
-      - action в ["OPEN_LONG", "ADD_LONG", "CLOSE_SHORT"] (открытие/добор/переворот в лонг)
-    - Если такой строки нет — возвращаем None.
+    Читает trade_history.csv и восстанавливает время входа.
+    КРИТИЧНО: история хранит UTC, но бот работает в UTC+4 локальном!
     """
     try:
         if not TRADE_HISTORY_PATH.exists():
-            print("⏱️ PositionTimer: trade_history.csv не найден, таймер не восстановлен")
+            print("⏱️ PositionTimer: trade_history.csv не найден")
             return None
 
         with TRADE_HISTORY_PATH.open("r", encoding="utf-8") as f:
             lines = f.readlines()
 
-        # Пропускаем заголовок, если он есть
         if not lines or len(lines) <= 1:
-            print("⏱️ PositionTimer: trade_history.csv пуст, таймер не восстановлен")
+            print("⏱️ PositionTimer: trade_history.csv пуст")
             return None
 
-        # Идём с конца файла вверх, ищем последнюю релевантную запись
-        for line in reversed(lines[1:]):  # пропускаем первую строку-заголовок
+        # Ищем последнюю запись с открытием позиции
+        for line in reversed(lines[1:]):
             line = line.strip()
             if not line:
                 continue
 
-            # Формат: time,figi,action,lots_before,lots_after,price,signal,confidence,reason
             parts = []
             current = ""
             in_quotes = False
@@ -1291,32 +1301,26 @@ def load_last_entry_time_from_history(figi: str) -> Optional[datetime]:
             except ValueError:
                 continue
 
-            # Нас интересуют только записи, после которых позиция > 0
             if lots_after <= 0:
                 continue
 
             try:
                 entry_time = datetime.fromisoformat(time_str)
+                # ✅ trade_history уже в UTC, ничего не преобразуем
             except Exception:
                 continue
 
-            # В логах time хранится в локальном времени сервера, приводим к UTC
-            if entry_time.tzinfo is None:
-                entry_time = entry_time.replace(tzinfo=timezone.utc)
-            else:
-                entry_time = entry_time.astimezone(timezone.utc)
+            print(f"⏱️ PositionTimer: восстановлено {entry_time.isoformat()}")
+            return entry_time  # ✅ ВЕРНУТЬ ЗНАЧЕНИЕ!
 
-            print(
-                f"⏱️ PositionTimer: восстановлено время входа из истории: {entry_time.isoformat()}")
-            return entry_time
 
-        print("⏱️ PositionTimer: не найдено подходящих записей в trade_history.csv")
+        print("⏱️ PositionTimer: не найдено подходящих записей")
         return None
 
     except Exception as e:
-        print(
-            f"⚠️ Ошибка при чтении trade_history.csv для восстановления таймера: {e}")
+        print(f"⚠️ Ошибка чтения trade_history.csv: {e}")
         return None
+
 
 
 async def log_trade(
@@ -1362,7 +1366,7 @@ def log_decision_block(
     rsi: float,
     trend: str,
     lots: int,
-    pnl_pct: float,
+    pnl_pct: float,  # Session PnL
     holding_hours: float,
     ai_signal: str,
     ai_confidence: int,
@@ -1374,7 +1378,9 @@ def log_decision_block(
     forced_entry: bool = False,
     consecutive_signals: int = 0,
     avg_confidence: float = 0.0,
+    position_pnl_pct: float = 0.0,  # ✅ НОВЫЙ параметр (в конец!)
 ):
+
     """
     Выводит блок принятия решения в консоль и записывает его в shadow_agents_log_{date}.jsonl.
     """
@@ -1394,18 +1400,26 @@ def log_decision_block(
     reason = str(reason)
     
     # 1. Визуальный вывод в консоль
+    # 1. Визуальный вывод в консоль
     print("\n" + "="*70)
     print(f"📊 DECISION BLOCK | Cycle: {cycle} | {datetime.now(pytz.timezone('Europe/Moscow')).strftime('%H:%M:%S')}")
     print("-" * 70)
     print(f"💰 Price: {price:.3f} | RSI: {rsi:.1f} | Trend LTF: {trend} | Trend HTF: {trend_htf}")
-    print(f"📦 Lots: {lots} | PnL: {pnl_pct:.2f}% | Holding: {holding_hours:.1f}h")
+
+    # ✅ ИСПРАВЛЕННАЯ СТРОКА:
+    if lots != 0:
+        print(f"📦 Lots: {lots} | Position PnL: {position_pnl_pct:+.2f}% | Session: {pnl_pct:+.2f}% | Holding: {holding_hours:.1f}h")
+    else:
+        print(f"📦 Lots: {lots} | PnL: 0.00% | Holding: {holding_hours:.1f}h")
+
     print(f"🤖 AI: {ai_signal} ({ai_confidence:.0f}%) | BIAS: {bias}")
-    
+
     if trend_override_reason:
         print(f"🧭 Trend override: {trend_override_reason}")
-    
+
     print(f"➡️ ACTION: {action}")
     print(f"📝 Reason: {reason}")
+
     
     # НОВЫЙ ВЫВОД для форсированных входов
     if forced_entry:
@@ -1545,11 +1559,11 @@ def decide_action(
         
         # Determine cooldown based on confidence
         if ai_confidence < 70:
-            cooldown_cycles = 15  # 15 minutes
+            cooldown_cycles = 10  # 10 minutes
         elif ai_confidence <= 70-85:
-            cooldown_cycles = 8  # 8 minutes
+            cooldown_cycles = 5  # 5 minutes
         else:
-            cooldown_cycles = 3   # 3 minutes
+            cooldown_cycles = 1   # 1 minutes
         
         if cycles_since_sl < cooldown_cycles and ai_signal_u in ("BUY", "SELL"):
             return "NOOP", f"🚫 COOLDOWN: SL exit {cycles_since_sl}/{cooldown_cycles} cycles ago, sig={ai_signal_u} conf={ai_confidence}", metadata
@@ -1557,35 +1571,40 @@ def decide_action(
 
 
     # ---------- 0) RISK EXITS FIRST (always win) ----------
-        # 0.1 Take Profit (multi-level)
-        # 0.1 Take Profit (3-level system: 1.5% / 3% / 5%)
-    # TP1: partial close at +1.5% (50% position)
+    # 0.1 Take Profit 3-level system (1.5%, 3%, 5%)
+    # TP1: partial close at 1.5% (50% position ONCE)
     if lots != 0 and pnl_pct >= 1.5:
         metadata["is_risk_exit"] = True
         
-        # If position >= 2 lots: close 50% (1 lot)
-        if abs(lots) >= 2:
-            close_qty = 1
+        # LONG: 5 lots → sell 50% = 2-3 lots at TP1
+        # SHORT: -5 lots → buy 50% = 2-3 lots at TP1
+        if abs(lots) >= 4:  # Close ~50% if position >= 4 lots
+            close_qty = max(1, abs(lots) // 2)  # 50% rounded
             side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
-            return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.5%, partial close {close_qty} lot (50%)", metadata
+            return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.5%, partial close {close_qty} lots (~50%)", metadata
         
-        # If position = 1 lot: keep for TP2 (don't close at TP1)
+        # If 1-3 lots: hold for TP2/TP3 (don't micro-exit)
         # Fall through to check TP2/TP3
-    
-    # TP2: partial close at +3.0% (close remaining 1 lot or full exit)
+
+    # TP2: close remaining 50% at 3.0%
     if lots != 0 and pnl_pct >= 3.0:
         metadata["is_risk_exit"] = True
         
-        # If 1 lot remaining: close 100%
-        if abs(lots) == 1:
+        # Close remaining position (1-3 lots left after TP1)
+        if abs(lots) >= 2:
+            close_qty = max(1, abs(lots) // 2)
+            side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
+            return side, f"✅ TP2 PnL{pnl_pct:.2f}% ≥3.0%, close {close_qty} lots", metadata
+        elif abs(lots) == 1:
             side = "SELLALL" if lots > 0 else "BUYALL"
             return side, f"✅ TP2 PnL{pnl_pct:.2f}% ≥3.0%, full exit (1 lot)", metadata
-    
-    # TP3: full exit at +5.0% (for trending days)
+
+    # TP3: full exit at 5.0% (trailing stop safety net)
     if lots != 0 and pnl_pct >= 5.0:
         metadata["is_risk_exit"] = True
         side = "SELLALL" if lots > 0 else "BUYALL"
         return side, f"✅ TP3 PnL{pnl_pct:.2f}% ≥5.0%, full exit (strong trend)", metadata
+
 
 
 
@@ -1672,39 +1691,116 @@ def decide_action(
         consecutive_sell_signals = 0
         sell_signals_history.clear()
 
-    # Adaptive threshold
+        # Adaptive threshold
     adaptive_threshold = 70 if atr > 0.15 else 60 if atr < 0.10 else 65
+
+    
+    # ---------- 3.5) FORCED ENTRY SAFETY CHECKS ----------
+    # Higher confidence threshold for forced entry
+    forced_entry_min_conf = 75  # Was 60-65 in adaptive_threshold
+    
+    # Block forced entry in extreme conditions
+    forced_entry_blocked = False
+    forced_entry_block_reason = ""
+    
+    if lots == 0:
+        # Check 1: Extreme RSI zones
+        if ai_signal_u == "BUY" and rsi <= 30:
+            forced_entry_blocked = True
+            forced_entry_block_reason = f"Forced BUY blocked: RSI {rsi:.1f} ≤ 30 (oversold)"
+        elif ai_signal_u == "SELL" and rsi >= 70:
+            forced_entry_blocked = True
+            forced_entry_block_reason = f"Forced SELL blocked: RSI {rsi:.1f} ≥ 70 (overbought)"
+        
+        # Check 2: Bias conflict
+        elif ai_signal_u == "BUY" and str(bias).upper() in ("SHORT_ONLY", "BEARISH"):
+            forced_entry_blocked = True
+            forced_entry_block_reason = f"Forced BUY blocked: conflicts with bias={bias}"
+        elif ai_signal_u == "SELL" and str(bias).upper() in ("LONG_ONLY", "BULLISH"):
+            forced_entry_blocked = True
+            forced_entry_block_reason = f"Forced SELL blocked: conflicts with bias={bias}"
+        
+        # Check 3: Falling knife / rising wedge
+        elif ai_signal_u == "BUY" and trend_u in ("DOWN", "IMPULSE_DOWN") and rsi <= 35:
+            forced_entry_blocked = True
+            forced_entry_block_reason = f"Forced BUY blocked: falling knife (trend={trend_u}, RSI {rsi:.1f})"
+        elif ai_signal_u == "SELL" and trend_u in ("UP", "IMPULSE_UP") and rsi >= 65:
+            forced_entry_blocked = True
+            forced_entry_block_reason = f"Forced SELL blocked: rising wedge (trend={trend_u}, RSI {rsi:.1f})"
+
+
+
 
     # ---------- 4) Forced entry BUY / SELL (flat only) ----------
     if lots == 0:
-        # Forced BUY after 3 consistent BUY signals
+                # Forced BUY after 3 consistent BUY signals
         if consecutive_buy_signals >= 3 and len(buy_signals_history) >= 3:
             avg_conf = sum(buy_signals_history[-3:]) / 3
             volume_confirmed = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
-
-            if avg_conf >= adaptive_threshold and rsi < 75 and bullish_prob > 0.55 and volume_confirmed:
+            
+            # 🚨 PATCH: Block forced BUY in extreme RSI or downtrend
+            # Requirement 1: Higher confidence threshold (75% instead of 60-65)
+            if avg_conf < 75:
+                pass  # Skip forced entry, continue to normal logic
+            # Requirement 2: Block in extreme RSI zones
+            elif rsi <= 30 or rsi >= 75:
+                pass  # Skip forced entry (oversold/overbought)
+            # Requirement 3: Block BUY when bias conflicts (SHORT_ONLY/BEARISH)
+            elif str(bias).upper() in ("SHORT_ONLY", "BEARISH"):
+                pass  # Skip forced BUY against bearish bias
+            # Requirement 4: Block BUY in downtrend with low RSI (falling knife)
+            elif trend_u in ("DOWN", "IMPULSE_DOWN") and rsi <= 35:
+                pass  # Skip BUY during strong downtrend
+            # All checks passed → allow forced entry
+            elif bullish_prob > 0.55 and volume_confirmed:
                 metadata.update(
                     {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
                 )
-                return "BUY1", f"🚨 FORCED ENTRY: 3 BUY (thr {adaptive_threshold}%, avg {avg_conf:.1f}%) RSI {rsi:.1f}", metadata
+                return "BUY1", f"🚨 FORCED ENTRY: 3 BUY (thr 75%, avg {avg_conf:.1f}%) RSI {rsi:.1f}", metadata
 
         # Forced SELL after 3 consistent SELL signals
         if consecutive_sell_signals >= 3 and len(sell_signals_history) >= 3:
             avg_conf_sell = sum(sell_signals_history[-3:]) / 3
             volume_confirmed_sell = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
 
-            if avg_conf_sell >= adaptive_threshold and rsi > 25 and bearish_prob > 0.55 and volume_confirmed_sell:
+            if not forced_entry_blocked and avg_conf_sell >= forced_entry_min_conf and rsi > 25 and bearish_prob > 0.55 and volume_confirmed_sell:
                 metadata.update(
+
                     {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
                 )
                 return "SELL1", f"🚨 FORCED SHORT: 3 SELL (thr {adaptive_threshold}%, avg {avg_conf_sell:.1f}%) RSI {rsi:.1f}", metadata
 
     # ---------- 5) Entry logic (flat only) ----------
+        # ---------- 5) Entry logic (flat only) ----------
     min_entry_conf = 40 if is_extreme else 70
     is_bullish_hedge = (str(bias).lower() == "bearish" and bullish_prob > 0.30)
     is_bearish_hedge = (str(bias).lower() == "bullish" and bearish_prob > 0.30)
 
     if lots == 0:
+        # GWDD target из глобальной переменной
+        target_lots = GWDD_TARGET_LOTS
+        
+        # ========== 🚨 BIAS FILTER (ДОБАВЛЕНО) ==========
+        bias_u = str(bias).upper().strip()
+        
+        # SHORT_ONLY → блокировать любые BUY входы
+        if bias_u == "SHORT_ONLY" and ai_signal_u == "BUY":
+            return "NOOP", f"⛔ BIAS CONFLICT: SHORT_ONLY blocks BUY signal (conf={effective_confidence})", metadata
+        
+        # LONG_ONLY → блокировать любые SELL входы
+        if bias_u == "LONG_ONLY" and ai_signal_u == "SELL":
+            return "NOOP", f"⛔ BIAS CONFLICT: LONG_ONLY blocks SELL signal (conf={effective_confidence})", metadata
+        
+        # BEARISH → блокировать агрессивный BUY (кроме hedge)
+        if bias_u == "BEARISH" and ai_signal_u == "BUY" and not is_bullish_hedge:
+            return "NOOP", f"⛔ BIAS CONFLICT: BEARISH blocks aggressive BUY (conf={effective_confidence}, no hedge)", metadata
+        
+        # BULLISH → блокировать агрессивный SELL (кроме hedge)
+        if bias_u == "BULLISH" and ai_signal_u == "SELL" and not is_bearish_hedge:
+            return "NOOP", f"⛔ BIAS CONFLICT: BULLISH blocks aggressive SELL (conf={effective_confidence}, no hedge)", metadata
+        # ========== КОНЕЦ BIAS FILTER ==========
+        
+        
         # Small test-entry on HOLD only in impulse up (optional, kept from your version)
         if (
             ai_signal_u == "HOLD"
@@ -1715,19 +1811,24 @@ def decide_action(
         ):
             return "BUY1", f"TEST ENTRY HOLD+Conf{ai_confidence} Bull{bullish_prob:.2f} RSI{rsi:.1f}", metadata
 
+        # === MAIN ENTRY: используем GWDD target_lots ===
         if ai_signal_u == "BUY" and effective_confidence >= min_entry_conf:
-            return "BUY1", f"Entry Conf{effective_confidence} Bullish{bullish_prob:.2f}", metadata
+            action = f"BUY{target_lots}"
+            return action, f"Entry Conf{effective_confidence} Bullish{bullish_prob:.2f} GWDD={target_lots}", metadata
 
         if is_bullish_hedge and rsi < 40:
-            return "BUY1", f"Hedge Long Prob{bullish_prob:.2f} vs Bias{bias}", metadata
+            action = f"BUY{target_lots}"
+            return action, f"Hedge Long Prob{bullish_prob:.2f} vs Bias{bias} GWDD={target_lots}", metadata
 
         if ai_signal_u == "SELL" and effective_confidence >= min_entry_conf:
-            return "SELL1", f"Entry Conf{effective_confidence} Bearish{bearish_prob:.2f}", metadata
+            action = f"SELL{target_lots}"
+            return action, f"Entry Conf{effective_confidence} Bearish{bearish_prob:.2f} GWDD={target_lots}", metadata
 
         if is_bearish_hedge and rsi > 60:
-            return "SELL1", f"Hedge Short Prob{bearish_prob:.2f} vs Bias{bias}", metadata
+            action = f"SELL{target_lots}"
+            return action, f"Hedge Short Prob{bearish_prob:.2f} vs Bias{bias} GWDD={target_lots}", metadata
 
-        # Mean reversion (flat only)
+        # === MEAN REVERSION: оставляем 1 лот (экстренный вход) ===
         if (rsi < 20 and bullish_prob > 0.15 and ai_signal_u != "SELL") or (
             rsi < 20 and str(bias).lower() == "bearish" and bullish_prob > 0.25 and ai_signal_u != "SELL"
         ):
@@ -1736,7 +1837,7 @@ def decide_action(
         if rsi > 80 and bearish_prob > 0.15 and ai_signal_u != "BUY":
             return "SELL1", f"🚨 OVERBOUGHT RSI{rsi:.1f} Bear{bearish_prob:.2f}", metadata
 
-        # Gap rule (kept)
+        # === GAP RULE: специальный случай — 2 лота ===
         if (
             trend_u == "IMPULSE_UP"
             and current_price
@@ -1745,9 +1846,10 @@ def decide_action(
             and ai_signal_u == "HOLD"
         ):
             return "BUY2", "⚡ IMMEDIATE Gap consolidation BUY2", metadata
+
+
         
     
-
     # ---------- 6) HOLD enforcement LAST (so it never blocks SL/TP) ----------
     # Секция 0 УЖЕ обработала все risk-exits (TP/SL/Emergency/Clearing)
     # Если код дошёл сюда — это НЕ risk-exit
@@ -1874,7 +1976,7 @@ async def main_loop():
     from src.shared_state import SharedTradingState
     
     sharedstate = SharedTradingState()
-    atr_stop = ATRStopEngine()  # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
+    atr_stop = ATRStopEngine(ksl_uptrend=2.0, ksl_other=1.5, ksl_flat=3.5, m_be=1.0)   # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
     prev_lots = 0
 
@@ -1891,19 +1993,20 @@ async def main_loop():
 
     # === GWDD ENGINE INITIALIZATION ===
     gwdd_config = GWDDConfig(
-        sigma_confidence=15.0,
-        sigma_rsi=10.0,
-        sigma_prob=0.15,
-        global_min_weight=0.50,
-        min_weight_conservative=0.55,
-        min_weight_moderate=0.50,
-        min_weight_aggressive=0.45,
-        risk_mode_adjustments={
-            "CONSERVATIVE": 0.5,
-            "MODERATE": 1.0,
-            "AGGRESSIVE": 1.5
-        }
+    sigma_confidence=15.0,
+    sigma_rsi=20.0,  # ✅ Increased from 10.0
+    sigma_prob=0.15,
+    global_min_weight=0.40,  # ✅ Lowered from 0.50
+    min_weight_conservative=0.60,  # ✅ Correct value
+    min_weight_moderate=0.55,  # ✅ Raised from 0.50
+    min_weight_aggressive=0.45,
+    risk_mode_adjustments={
+        "CONSERVATIVE": 0.5,
+        "MODERATE": 1.0,
+        "AGGRESSIVE": 1.5
+    }
     )
+
     gwdd_engine = GWDDEngine(gwdd_config)
     risk_agent = RiskAgent()
     executor = MainOrderExecutor(token)
@@ -1917,12 +2020,12 @@ async def main_loop():
 
     cycle = 0
     position_timer = PositionTimer()
-    MAX_LOTS_ALLOWED = 8
+    MAX_LOTS_ALLOWED = 10
     prev_lots = 0
     # === SL COOLDOWN TRACKING ===
     last_sl_exit_cycle = -999  # Цикл когда был последний выход по SL
     last_sl_exit_price = 0.0   # Цена выхода по SL
-    SL_COOLDOWN_CYCLES = 10     # Минимум циклов до повторного входа после SL
+    SL_COOLDOWN_CYCLES = 3     # Минимум циклов до повторного входа после SL
 
 
     
@@ -1989,15 +2092,16 @@ async def main_loop():
                 print(f"POSITION CONFIRMED: {prev_lots}→{current_lots}, cooldowns RESET!")
             prev_lots = current_lots
             
+            
+            
             # === ATR STOP: OPEN/CLOSE DETECTION ===
             if prev_lots == 0 and current_lots != 0:
                 # Открылась новая позиция
-                direction = "LONG" if current_lots > 0 else "SHORT"  # ← ДИНАМИЧЕСКИЙ direction
+                direction = "LONG" if current_lots > 0 else "SHORT"
                 atr_0 = float(data.get("ATR", 0.015)) if 'data' in locals() else 0.015
-
-
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0)
-
+                trend_5m = data.get("trend_5m", "FLAT") if 'data' in locals() else "FLAT"  # ✅ ДОБАВЛЕНО
+                
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0, trend=trend_5m)  # ✅ trend передан
 
                 # Синхронизируем с shared state
                 sharedstate.entry_price = avg_price
@@ -2011,10 +2115,12 @@ async def main_loop():
             elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
                 direction = "LONG" if current_lots > 0 else "SHORT"
                 atr_0 = float(data.get("ATR", 0.015)) if 'data' in locals() else 0.015
-
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0)
+                trend_5m = data.get("trend_5m", "FLAT") if 'data' in locals() else "FLAT"  # ✅ ДОБАВЛЕНО
+                
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0, trend=trend_5m)  # ✅ trend передан
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
+                
             elif prev_lots > 0 and current_lots == 0:
                 # Позиция полностью закрыта
                 atr_stop.on_close()
@@ -2028,7 +2134,10 @@ async def main_loop():
             prev_lots = current_lots
 
 
+
+
             # 2. Получение и анализ свечей
+                    
             candles = await executor.get_candles_5m(ACTIVE_FIGI)
             if candles.empty:
                 print("⚠️ Свечи не получены, ожидание 10с...")
@@ -2037,8 +2146,30 @@ async def main_loop():
 
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
-            
             atr_t = float(data.get("ATR", 0.015))
+
+            # === SLEEPING MARKET DETECTION ===
+            trend_5m = str(data.get("trend_5m", data.get("trend", "FLAT"))).upper()
+            # Берём high/low за день (если есть) или из последних свечей
+            p_high = float(data.get("day_high", candles["high"].max()))
+            p_low = float(data.get("day_low", candles["low"].min()))
+            intraday_range = p_high - p_low
+
+            sleeping_market = False
+            if (
+                trend_5m == "FLAT"
+                and atr_t < 0.020
+                and intraday_range < 3 * atr_t
+            ):
+                sleeping_market = True
+                sharedstate.sleeping_market = True
+                print(
+                    f"💤 SLEEPING MARKET: FLAT + ATR={atr_t:.4f} < 0.020 "
+                    f"+ range={intraday_range:.4f} < {3*atr_t:.4f} → блокировка активных входов"
+                )
+            else:
+                sharedstate.sleeping_market = False
+
 
             # ATR STOP: открытие / закрытие
             if prev_lots == 0 and current_lots != 0:
@@ -2078,16 +2209,45 @@ async def main_loop():
                     sharedstate.p_low_since_entry = st.p_low_since_entry
 
 
-            # Расчет PnL
-            if current_lots > 0 and avg_price > 0:
-                pnl_pct = ((current_price - avg_price) / avg_price) * 100
+            
+            # Расчёт PnL: используем вариационную маржу из брокера (expected_yield)
+            # Расчёт PnL: два типа для фьючерсов
+            # 1) Session PnL — от клиринга (expected_yield от брокера)
+            # 2) Position PnL — от момента открытия текущей позиции
+            if current_lots != 0 and avg_price > 0:
+                # 1️⃣ SESSION PnL — накопленный с момента клиринга (из expected_yield)
+                expected_yield = pos.get("expected_yield", 0.0)
+                
+                if expected_yield != 0:
+                    position_value_rub = abs(current_lots * avg_price * 1000)  # 1 лот = 1000 MMBtu
+                    session_pnl_pct = (expected_yield / position_value_rub) * 100
+                else:
+                    session_pnl_pct = 0.0
+                
+                # 2️⃣ POSITION PnL — от момента открытия текущей позиции
+                if current_lots > 0:  # LONG
+                    position_pnl_pct = ((current_price - avg_price) / avg_price) * 100
+                else:  # SHORT
+                    position_pnl_pct = ((avg_price - current_price) / avg_price) * 100
+                
+                # Для совместимости: pnl_pct = session_pnl_pct (используется в старых местах)
+                pnl_pct = session_pnl_pct
             else:
+                session_pnl_pct = 0.0
+                position_pnl_pct = 0.0
                 pnl_pct = 0.0
+
+                pnl_pct = 0.0
+
+            
+            
             # Расчет времени удержания позиции
             if sharedstate.entry_time is not None:
                 holding_hours = (time_module.time() - sharedstate.entry_time) / 3600
+                holding_hours = max(0.0, holding_hours)  # ✅ Никогда не отрицательный
             else:
                 holding_hours = 0.0
+
             rsi_val = float(data.get("RSI", 50.0))
             trend_5m = data.get("trend", "FLAT")
             current_volume = int(candles["volume"].iloc[-1]) if not candles.empty and "volume" in candles.columns else 0
@@ -2095,6 +2255,7 @@ async def main_loop():
             
             
             atr_t = float(data.get("ATR", 0.015))
+
 
             # === ATR STOP: OPEN/CLOSE & UPDATE ===
             # Открытие новой позиции
@@ -2348,10 +2509,10 @@ async def main_loop():
                 )
                 
                 # Override weight если задан FORCE_WEIGHT из Planner
-                planner_force_weight = plan_result.get("force_weight")
-                if planner_force_weight is not None:
-                    entry_weight = planner_force_weight
-                    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight:.3f}")
+                #planner_force_weight = plan_result.get("force_weight")
+                #if planner_force_weight is not None:
+                #    entry_weight = planner_force_weight
+                #    print(f"⚡ FORCE_WEIGHT override (Planner): {entry_weight:.3f}")
 
                 should_enter, weight_final, gwdd_reason = gwdd_engine.decide_entry(
                     entry_weight=entry_weight,
@@ -2361,12 +2522,19 @@ async def main_loop():
                 )
 
                 position_size = gwdd_engine.get_position_sizing(
-                    entry_weight=entry_weight,
-                    max_lots=MAX_LOTS_ALLOWED,
-                    risk_mode=gwdd_mode,
-                    rsi=rsi_val,
+                entry_weight=entry_weight,
+                max_lots=MAX_LOTS_ALLOWED,
+                risk_mode=gwdd_mode,
+                rsi=rsi_val,
+                current_lots=current_lots,  # ✅ Передаём текущую позицию
                 )
 
+                # Сохраняем GWDD для decide_action
+                global GWDD_TARGET_LOTS, GWDD_WEIGHT
+                GWDD_TARGET_LOTS = position_size
+                GWDD_WEIGHT = entry_weight
+                print(f"🔧 GWDD → decide_action: target_lots={GWDD_TARGET_LOTS}, weight={GWDD_WEIGHT:.3f}")
+                
             except Exception as e:
                 print(f"⚠️ GWDD ERROR: {e}")
                 entry_weight = 0.5
@@ -2442,6 +2610,7 @@ async def main_loop():
 
             # 9. DECISION_BLOCK
 
+        
             action, action_reason, decision_metadata = decide_action(
                 lots=current_lots,
                 target_lots=target_lots_signed,
@@ -2462,24 +2631,28 @@ async def main_loop():
                 current_price=current_price,
                 sl_level=sharedstate.sl_level,
                 pnl_pct=pnl_pct,
-                last_sl_exit_cycle=last_sl_exit_cycle,  
-                current_cycle=cycle
+                last_sl_exit_cycle=last_sl_exit_cycle,
+                current_cycle=cycle,
             )
-            # ========== RISK-EXIT OVERRIDE (BEFORE any gates) ==========
-            is_risk_exit = decision_metadata.get("is_risk_exit", False)
-            if is_risk_exit:
-                can_execute = True
-                print(f"✅ RISK EXIT OVERRIDE: can_execute=True (reason={action_reason})")
-            
-         
-	
-            # --- SLEEPING MARKET GATE (Variant B): block only GWDD Target rebalance in FLAT ---
-            sleeping_market = (trend_5m == "FLAT")
 
-            if sleeping_market and isinstance(action_reason, str) and action_reason.startswith("GWDD Target"):
-                print(f"😴 SLEEPING MARKET: blocked {action} | {action_reason}")
-                action = "NOOP"
-                action_reason = f"SLEEPING MARKET: blocked {action_reason}"
+            # === SLEEPING MARKET FILTER ===
+            # Блокируем новые активные входы, если рынок "спит"
+            if sharedstate.sleeping_market and action not in ("NOOP", "BUYALL", "SELLALL"):
+                # Проверяем, является ли действие открытием новой позиции
+                is_new_entry = (current_lots == 0 and action.startswith(("BUY", "SELL")))
+                
+                if is_new_entry:
+                    # Разрешить только аварийные входы при экстремальном RSI
+                    if rsi_val < 25:
+                        print("⚡ SLEEPING MARKET OVERRIDE: RSI < 25 (OVERSOLD) → разрешён вход")
+                    elif rsi_val > 75:
+                        print("⚡ SLEEPING MARKET OVERRIDE: RSI > 75 (OVERBOUGHT) → разрешён вход")
+                    else:
+                        print("❌ SLEEPING MARKET: новый активный вход заблокирован, удерживаем текущую позицию")
+                        action = "NOOP"
+                        action_reason = (action_reason + " | SLEEPING MARKET: block new entries").strip(" |")
+
+
            
 
             
@@ -2602,15 +2775,17 @@ async def main_loop():
                 # === SL COOLDOWN CHECK ===
                 if last_sl_exit_cycle >= 0 and not is_position_reduction:
                     cycles_since_sl = cycle - last_sl_exit_cycle
-                    
-                    if cycles_since_sl < SL_COOLDOWN_CYCLES:
-                        # Недавний выход по SL
-                        price_diff_pct = abs(current_price - last_sl_exit_price) / last_sl_exit_price * 100
-                        
-                        if price_diff_pct < 1.0:  # Цена в той же зоне (±1%)
-                            trade_allowed = False
-                            block_reason = f"SL_COOLDOWN: {cycles_since_sl}/{SL_COOLDOWN_CYCLES} cycles since SL exit @ {last_sl_exit_price:.3f}"
-                            print(f"🚫 {block_reason}")
+                    price_diff_pct = abs(current_price - last_sl_exit_price) / last_sl_exit_price * 100 if last_sl_exit_price > 0 else 999
+
+                    # Bypass cooldown only for position reduction (risk exits)
+                    if current_lots != 0 and is_position_reduction and is_risk_exit:
+                        print("🔄 SL_COOLDOWN BYPASS: risk exit for existing position")
+                    # Main cooldown check: block new entries for SL_COOLDOWN_CYCLES
+                    elif cycles_since_sl < SL_COOLDOWN_CYCLES and current_lots == 0:
+                        trade_allowed = False
+                        block_reason = f"SL_COOLDOWN: {cycles_since_sl}/{SL_COOLDOWN_CYCLES} cycles since SL exit @ {last_sl_exit_price:.3f}"
+                        print(block_reason)
+
     
 
                
@@ -2693,10 +2868,12 @@ async def main_loop():
                 action=action,
                 reason=action_reason,
                 pnl_pct=pnl_pct,
+                position_pnl_pct=position_pnl_pct,  # ✅ НОВЫЙ параметр
                 forced_entry=decision_metadata.get("forced_entry", False),
                 consecutive_signals=decision_metadata.get("consecutive_signals", 0),
                 avg_confidence=decision_metadata.get("avg_confidence", 0.0),
             )
+
             
             # Обогащаем данными из broker API
             enriched_event = await enrich_cycle_event(

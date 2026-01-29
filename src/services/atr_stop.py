@@ -36,17 +36,19 @@ class ATRStopEngine:
     - При прибыли >= m_be * ATR_0 подтягиваем к безубытку
     """
 
-    def __init__(self, k_sl_uptrend: float = 2.0, k_sl_other: float = 1.5, m_be: float = 1.0):
+    def __init__(self, ksl_uptrend: float = 2.0, ksl_other: float = 1.5, ksl_flat: float = 3.5, m_be: float = 1.0):
         """
-        k_sl_uptrend – множитель ATR для позиций по тренду (LONG+UP, SHORT+DOWN)
-        k_sl_other – множитель ATR для остальных случаев
-        m_be – множитель ATR_0 для перевода стопа в безубыток
+        Args:
+            ksl_uptrend: ATR multiplier for LONG/UPTREND, SHORT/DOWNTREND
+            ksl_other: ATR multiplier for other
+            ksl_flat: ATR multiplier for FLAT (raised from 2.5 to 3.5 to avoid whipsaw)
+            m_be: ATR multiplier for breakeven
         """
-        self.k_sl_uptrend = k_sl_uptrend
-        self.k_sl_other = k_sl_other
-        self.k_sl_flat = 2.5  # Специальный множитель для FLAT (anti-whipsaw)
+        self.ksl_uptrend = ksl_uptrend
+        self.ksl_other = ksl_other
+        self.ksl_flat = ksl_flat  # ✅ Now configurable, default 3.5
         self.m_be = m_be
-        self.state: Optional[ATRStopState] = None
+
 
     def on_open(self, direction: str, entry_price: float, atr_0: float, trend: str = "FLAT") -> None:
         """
@@ -66,11 +68,11 @@ class ATRStopEngine:
 
         # Определить k_sl на основе направления и тренда
         if (direction == "LONG" and trend == "UPTREND") or (direction == "SHORT" and trend == "DOWNTREND"):
-            k_sl = self.k_sl_uptrend  # 2.0 для позиций по тренду
+            k_sl = self.ksl_uptrend  # 2.0 для позиций по тренду
         elif trend == "FLAT":
-            k_sl = self.k_sl_flat  # 2.5 для FLAT (wider stop to avoid whipsaw)
+            k_sl = self.ksl_flat  # 2.5 для FLAT (wider stop to avoid whipsaw)
         else:
-            k_sl = self.k_sl_other  # 1.5 для остальных
+            k_sl = self.ksl_other  # 1.5 для остальных
 
         # Рассчитать initial SL
         if direction == "LONG":
@@ -135,11 +137,11 @@ class ATRStopEngine:
 
         # Определить k_sl на основе текущего тренда
         if (s.direction == "LONG" and s.trend == "UPTREND") or (s.direction == "SHORT" and s.trend == "DOWNTREND"):
-            k_sl = self.k_sl_uptrend
+            k_sl = self.ksl_uptrend
         elif s.trend == "FLAT":
-            k_sl = self.k_sl_flat  # 2.5 для FLAT
+            k_sl = self.ksl_flat  # 2.5 для FLAT
         else:
-            k_sl = self.k_sl_other
+            k_sl = self.ksl_other
 
         # Обновление экстремумов
         if s.direction == "LONG":
