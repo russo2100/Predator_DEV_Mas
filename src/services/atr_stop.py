@@ -36,7 +36,7 @@ class ATRStopEngine:
     - При прибыли >= m_be * ATR_0 подтягиваем к безубытку
     """
 
-    def __init__(self, ksl_uptrend: float = 2.0, ksl_other: float = 1.5, ksl_flat: float = 3.5, m_be: float = 1.0):
+    def __init__(self, ksl_uptrend: float = 3.0, ksl_other: float = 3.5, ksl_flat: float = 5.0, m_be: float = 1.0):
         """
         Args:
             ksl_uptrend: ATR multiplier for LONG/UPTREND, SHORT/DOWNTREND

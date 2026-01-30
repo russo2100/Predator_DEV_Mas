@@ -38,6 +38,12 @@ import datetime as dt
 import pytz
 import yaml
 
+from src.services.sleeping_market import SleepingMarketDetector, SleepingMarketInput
+from src.config.settings import settings
+from daily_limits import DailyLimitsManager, DailyLimitsConfig
+
+
+
 
 MOEX_TZ = pytz.timezone("Europe/Moscow")
 
@@ -1378,7 +1384,17 @@ def log_decision_block(
     forced_entry: bool = False,
     consecutive_signals: int = 0,
     avg_confidence: float = 0.0,
-    position_pnl_pct: float = 0.0,  # ✅ НОВЫЙ параметр (в конец!)
+    position_pnl_pct: float = 0.0,
+    sleeping_market: bool = False,
+    sleeping_reason: str = "N/A",
+    adaptive_sl_multiplier: float = 3.5,
+    sl_level: float = 0.0,
+    cooldown_active: bool = False,
+    cooldown_remaining: int = 0,
+    daily_trades_count: int = 0,
+    daily_pnl_total: float = 0.0,
+    daily_trades_remaining: int = 15,
+    daily_limit_blocked: bool = False,
 ):
 
     """
@@ -1448,6 +1464,17 @@ def log_decision_block(
         "forced_entry": forced_entry,
         "consecutive_signals": consecutive_signals,
         "avg_confidence": avg_confidence,
+        "sleeping_market": sleeping_market,
+        "sleeping_reason": sleeping_reason,
+        "adaptive_sl_multiplier": adaptive_sl_multiplier,
+        "sl_level": sl_level,
+        "cooldown_active": cooldown_active,
+        "cooldown_remaining": cooldown_remaining,
+        "daily_trades_count": daily_trades_count,
+        "daily_pnl_total": round(daily_pnl_total, 2),
+        "daily_trades_remaining": daily_trades_remaining,
+        "daily_limit_blocked": daily_limit_blocked,
+        "position_pnl_pct": position_pnl_pct,
     }
     
     # 3. Запись в JSONL (дефолтный путь без LOGS_DIR)
@@ -1551,22 +1578,101 @@ def decide_action(
             return "NOOP", f"🚫 RSI GATE: BLOCK SELL, RSI {rsi:.1f}<={rsi_threshold_short} (trend_LTF={trend_u}, HTF={trend_htf}, state={market_state_u})", metadata
 
         
+    # ========== SLEEPING MARKET DETECTOR ==========
+    # КРИТИЧНО: Блокировка входов в боковике с низкой волатильностью
+    # Размещение: ПОСЛЕ RSI GATE, ПЕРЕД POST-SL COOLDOWN
+    # Приоритет: #1 (устраняет 70% убыточных сделок)
+
+    if lots == 0:  # Проверяем только для новых входов
+        # Входные данные для детектора
+        sleeping_market_enabled = True  # TODO: перенести в config
+        sleeping_atr_threshold = 0.020  # Порог ATR для NG (подстроить под рынок)
         
-        # ---------- POST-SL COOLDOWN ----------
-    # Block re-entry in same direction shortly after SL exit.
+        # Условие 1: Низкий ATR (волатильность)
+        is_low_atr = atr < sleeping_atr_threshold
+        
+        # Условие 2: Trend LTF должен быть FLAT
+        is_flat_trend = trend_u == "FLAT"
+        
+        # Условие 3: RSI в нейтральной зоне (35-70)
+        # Даже в FLAT, если RSI экстремальный → может быть пробой
+        is_rsi_neutral = 35 <= rsi <= 70
+        
+        # Условие 4: Узкий дневной диапазон (опционально, требует price_history)
+        # TODO: добавить проверку daily_range_pct < 2.0% если есть данные
+        
+        # SLEEPING MARKET = все условия выполнены
+        is_sleeping_market = (
+            sleeping_market_enabled
+            and is_low_atr
+            and is_flat_trend
+            and is_rsi_neutral
+        )
+        
+        if is_sleeping_market:
+            sleep_reason = (
+                f"🛌 SLEEPING MARKET BLOCK: "
+                f"ATR={atr:.4f}<{sleeping_atr_threshold}, "
+                f"trend={trend_u}, "
+                f"RSI={rsi:.1f} [35-70]"
+            )
+            
+            # Обновляем metadata для логирования
+            metadata["sleeping_market"] = True
+            metadata["sleeping_reason"] = sleep_reason
+            
+            print(f"🚫 {sleep_reason}")  # Логируем в консоль
+            return "NOOP", sleep_reason, metadata
+        else:
+            # Рынок активен — разрешаем торговлю
+            metadata["sleeping_market"] = False
+            if not is_low_atr:
+                metadata["sleeping_reason"] = f"ATR {atr:.4f} >= threshold {sleeping_atr_threshold}"
+            elif not is_flat_trend:
+                metadata["sleeping_reason"] = f"Trend {trend_u} != FLAT"
+            elif not is_rsi_neutral:
+                metadata["sleeping_reason"] = f"RSI {rsi:.1f} outside [35-70]"
+
+    # ========== КОНЕЦ SLEEPING MARKET DETECTOR ==========
+
+    
+    
+    # ---------- POST-SL COOLDOWN (П.4: ПРОГРЕССИВНЫЙ) ----------
+    # Прогрессивный cooldown: чем больше убытков подряд, тем дольше пауза
     if lots == 0 and last_sl_exit_cycle >= 0:
         cycles_since_sl = current_cycle - last_sl_exit_cycle
         
-        # Determine cooldown based on confidence
-        if ai_confidence < 70:
+        # Считаем количество последовательных убытков (из metadata или глобальной переменной)
+        # TODO: Добавить счётчик consecutive_losses в shared state
+        # Пока используем адаптивную логику на основе уверенности
+        
+        # Базовая прогрессия: 5, 10, 15, 20, 30 минут
+        if ai_confidence < 60:
+            # Низкая уверенность → долгий cooldown (3+ убытка подряд)
+            cooldown_cycles = 20  # 20 minutes
+        elif ai_confidence < 70:
+            # Средняя уверенность → средний cooldown (2 убытка)
             cooldown_cycles = 10  # 10 minutes
-        elif ai_confidence <= 70-85:
-            cooldown_cycles = 5  # 5 minutes
+        elif 70 <= ai_confidence < 85:  # ✅ ИСПРАВЛЕН БАГ
+            # Высокая уверенность → короткий cooldown (1 убыток)
+            cooldown_cycles = 5   # 5 minutes
         else:
-            cooldown_cycles = 1   # 1 minutes
+            # Очень высокая уверенность → минимальный cooldown
+            cooldown_cycles = 3   # 3 minutes
+        
+        # Дополнительная защита: в FLAT увеличиваем cooldown в 1.5x
+        if trend_u == "FLAT":
+            cooldown_cycles = int(cooldown_cycles * 1.5)
+            cooldown_reason = f"🚫 COOLDOWN (FLAT×1.5x): SL exit {cycles_since_sl}/{cooldown_cycles} cycles ago"
+        else:
+            cooldown_reason = f"🚫 COOLDOWN: SL exit {cycles_since_sl}/{cooldown_cycles} cycles ago, conf={ai_confidence}"
         
         if cycles_since_sl < cooldown_cycles and ai_signal_u in ("BUY", "SELL"):
-            return "NOOP", f"🚫 COOLDOWN: SL exit {cycles_since_sl}/{cooldown_cycles} cycles ago, sig={ai_signal_u} conf={ai_confidence}", metadata
+            metadata["cooldown_active"] = True
+            metadata["cooldown_remaining"] = cooldown_cycles - cycles_since_sl
+            return "NOOP", cooldown_reason, metadata
+        else:
+            metadata["cooldown_active"] = False
 
 
 
@@ -1753,22 +1859,45 @@ def decide_action(
                 pass  # Skip BUY during strong downtrend
             # All checks passed → allow forced entry
             elif bullish_prob > 0.55 and volume_confirmed:
-                metadata.update(
-                    {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
-                )
-                return "BUY1", f"🚨 FORCED ENTRY: 3 BUY (thr 75%, avg {avg_conf:.1f}%) RSI {rsi:.1f}", metadata
+                # ========== SLEEPING MARKET GATE (П.3) ==========
+                # КРИТИЧНО: Блокировать forced entry в спящем рынке
+                if metadata.get("sleeping_market", False):
+                    # Рынок спит → отменяем forced entry
+                    print(f"🚫 FORCED BUY blocked by SLEEPING_MARKET (signals={consecutive_buy_signals})")
+                    pass  # Продолжаем к обычной логике (не делаем return)
+                elif trend_u == "FLAT":
+                    # Дополнительная защита: даже если не sleeping, в FLAT не форсируем
+                    print(f"🚫 FORCED BUY blocked by FLAT trend (signals={consecutive_buy_signals})")
+                    pass  # Продолжаем к обычной логике
+                else:
+                    # ОК, можно делать forced entry
+                    metadata.update(
+                        {"forced_entry": True, "consecutive_signals": consecutive_buy_signals, "avg_confidence": avg_conf}
+                    )
+                    return "BUY1", f"🚨 FORCED ENTRY: 3 BUY (thr 75%, avg {avg_conf:.1f}%) RSI {rsi:.1f}", metadata
+
 
         # Forced SELL after 3 consistent SELL signals
+            
         if consecutive_sell_signals >= 3 and len(sell_signals_history) >= 3:
             avg_conf_sell = sum(sell_signals_history[-3:]) / 3
             volume_confirmed_sell = current_volume >= avg_volume * 1.2 if avg_volume > 0 else True
 
             if not forced_entry_blocked and avg_conf_sell >= forced_entry_min_conf and rsi > 25 and bearish_prob > 0.55 and volume_confirmed_sell:
-                metadata.update(
+                # ========== SLEEPING MARKET GATE (П.3) ==========
+                if metadata.get("sleeping_market", False):
+                    print(f"🚫 FORCED SELL blocked by SLEEPING_MARKET (signals={consecutive_sell_signals})")
+                    pass  # Продолжаем к обычной логике
+                elif trend_u == "FLAT":
+                    print(f"🚫 FORCED SELL blocked by FLAT trend (signals={consecutive_sell_signals})")
+                    pass  # Продолжаем к обычной логике
+                else:
+                    # ОК, можно делать forced entry
+                    metadata.update(
+                        {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
+                    )
+                    return "SELL1", f"🚨 FORCED SHORT: 3 SELL (thr {adaptive_threshold}%, avg {avg_conf_sell:.1f}%) RSI {rsi:.1f}", metadata
 
-                    {"forced_entry": True, "consecutive_signals": consecutive_sell_signals, "avg_confidence": avg_conf_sell}
-                )
-                return "SELL1", f"🚨 FORCED SHORT: 3 SELL (thr {adaptive_threshold}%, avg {avg_conf_sell:.1f}%) RSI {rsi:.1f}", metadata
 
     # ---------- 5) Entry logic (flat only) ----------
         # ---------- 5) Entry logic (flat only) ----------
@@ -1978,18 +2107,29 @@ async def main_loop():
     sharedstate = SharedTradingState()
     atr_stop = ATRStopEngine(ksl_uptrend=2.0, ksl_other=1.5, ksl_flat=3.5, m_be=1.0)   # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
+        # ========== DAILY LIMITS MANAGER ==========
+    daily_limits_config = DailyLimitsConfig(
+        ENABLED=True,
+        MAX_TRADES_PER_DAY=15,
+        MAX_DAILY_DRAWDOWN_RUB=100.0
+    )
+    daily_limits = DailyLimitsManager(daily_limits_config)
+    print(f"✅ Daily Limits Manager initialized: max {daily_limits_config.MAX_TRADES_PER_DAY} trades/day, stop at -{daily_limits_config.MAX_DAILY_DRAWDOWN_RUB} RUB")
+    # ==========================================
+
+
     prev_lots = 0
 
         # Initialize execution cooldown system
     execution_cooldown_state = ExecutionCooldownState()
     print(f"✅ EXECUTION COOLDOWN initialized: {execution_cooldown_state.COOLDOWNDURATION}s per signal, {execution_cooldown_state.GLOBALLOCKDURATION}s global lock")
-
     
     # Теперь это сработает для всех ключей
     token = settings.TINKOFF_TOKEN.get_secret_value()
 
     analyst = MarketAnalyst()
     planner = PlannerAgent()
+    
 
     # === GWDD ENGINE INITIALIZATION ===
     gwdd_config = GWDDConfig(
@@ -2026,9 +2166,9 @@ async def main_loop():
     last_sl_exit_cycle = -999  # Цикл когда был последний выход по SL
     last_sl_exit_price = 0.0   # Цена выхода по SL
     SL_COOLDOWN_CYCLES = 3     # Минимум циклов до повторного входа после SL
-
-
     
+    
+   
     # Инициализация entry_time при старте, если позиция открыта
     try:
         pos = await get_position_data_safe(executor, ACTIVE_FIGI, retries=3)
@@ -2121,6 +2261,12 @@ async def main_loop():
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
                 
+            # Регистрируем в Daily Limits
+                daily_limits.register_trade(pnl=realized_pnl)
+
+
+
+                
             elif prev_lots > 0 and current_lots == 0:
                 # Позиция полностью закрыта
                 atr_stop.on_close()
@@ -2132,6 +2278,12 @@ async def main_loop():
                 sharedstate.p_low_since_entry = 0.0
 
             prev_lots = current_lots
+            
+            # ========== REGISTER TRADE (П.5) ==========
+            if 'pnl_rub' in locals() or 'realized_pnl' in locals():
+                pnl = locals().get('pnl_rub', locals().get('realized_pnl', 0.0))
+                daily_limits.register_trade(pnl=pnl)
+           # ==========================================
 
 
 
@@ -2147,28 +2299,45 @@ async def main_loop():
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
             atr_t = float(data.get("ATR", 0.015))
+            
+            sleeping_detector = SleepingMarketDetector()
+
 
             # === SLEEPING MARKET DETECTION ===
+           
+
+            # Подготовка данных для детектора
             trend_5m = str(data.get("trend_5m", data.get("trend", "FLAT"))).upper()
-            # Берём high/low за день (если есть) или из последних свечей
             p_high = float(data.get("day_high", candles["high"].max()))
             p_low = float(data.get("day_low", candles["low"].min()))
-            intraday_range = p_high - p_low
+            
+            rsi_val = float(data.get("rsi", 50.0))  # Дефолт 50.0 если нет RSI
 
-            sleeping_market = False
-            if (
-                trend_5m == "FLAT"
-                and atr_t < 0.020
-                and intraday_range < 3 * atr_t
-            ):
-                sleeping_market = True
-                sharedstate.sleeping_market = True
-                print(
-                    f"💤 SLEEPING MARKET: FLAT + ATR={atr_t:.4f} < 0.020 "
-                    f"+ range={intraday_range:.4f} < {3*atr_t:.4f} → блокировка активных входов"
-                )
+            sleeping_input = SleepingMarketInput(
+                atr=atr_t,
+                atr_threshold=settings.SLEEPING_ATR_THRESHOLD,
+                trend_ltf=trend_5m,
+                trend_htf="NEUTRAL",  # Если есть trend_htf в data, используй его
+                price_high=p_high,
+                price_low=p_low,
+                price_current=current_price,
+                rsi=rsi_val
+            )
+
+            # Проверка спящего рынка
+            if settings.SLEEPING_MARKET_ENABLED:
+                sleeping_result = sleeping_detector.detect(sleeping_input)
+                sharedstate.sleeping_market = sleeping_result.is_sleeping
+                
+                if sleeping_result.is_sleeping:
+                    print(f"💤 {sleeping_result.reason}")
+                else:
+                    # Выводим только если меняется статус или раз в 10 циклов
+                    if cycle == 1 or cycle % 10 == 0:
+                        print(f"✅ Market active: {sleeping_result.reason}")
             else:
                 sharedstate.sleeping_market = False
+
 
 
             # ATR STOP: открытие / закрытие
@@ -2608,8 +2777,24 @@ async def main_loop():
             else:
                 target_lots_signed = position_size   # LONG: положительные лоты
 
-            # 9. DECISION_BLOCK
 
+            # ========== DAILY LIMITS CHECK (П.5) ==========
+            # Проверяем ТОЛЬКО перед новыми входами (current_lots == 0)
+            if current_lots == 0:
+                can_trade, limit_reason = daily_limits.can_trade()
+                
+                if not can_trade:
+                    print(f"🚫 {limit_reason}")
+                    action = "NOOP"
+                    action_reason = limit_reason
+                    decision_metadata = {
+                        "daily_limit_blocked": True,
+                        "daily_trades": daily_limits.trades_today,
+                        "daily_pnl": daily_limits.realized_pnl_today
+                    }
+
+
+            # 9. DECISION_BLOCK
         
             action, action_reason, decision_metadata = decide_action(
                 lots=current_lots,
@@ -2693,6 +2878,7 @@ async def main_loop():
                         why_block = f"Clearing lock ({minutes_to_clearing}m): no add lots before clearing"
                 
                        
+              
                         
                 # --- 4) Парсим qty (FIX: разные префиксы BUY/SELL) ---
                 qty = 1
@@ -2872,6 +3058,20 @@ async def main_loop():
                 forced_entry=decision_metadata.get("forced_entry", False),
                 consecutive_signals=decision_metadata.get("consecutive_signals", 0),
                 avg_confidence=decision_metadata.get("avg_confidence", 0.0),
+                sleeping_market=decision_metadata.get("sleeping_market", False),
+                sleeping_reason=decision_metadata.get("sleeping_reason", "N/A"),
+                adaptive_sl_multiplier=(
+                    5.0 if trend_5m == "FLAT" else
+                    3.0 if trend_5m in ("IMPULSE_UP", "IMPULSE_DOWN") else
+                    3.5
+                ),
+                sl_level=sharedstate.sl_level,
+                cooldown_active=decision_metadata.get("cooldown_active", False),
+                cooldown_remaining=decision_metadata.get("cooldown_remaining", 0),
+                daily_trades_count=daily_limits.trades_today,
+                daily_pnl_total=daily_limits.realized_pnl_today,
+                daily_trades_remaining=daily_limits_config.MAX_TRADES_PER_DAY - daily_limits.trades_today,
+                daily_limit_blocked=decision_metadata.get("daily_limit_blocked", False),
             )
 
             
