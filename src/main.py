@@ -40,7 +40,7 @@ import yaml
 
 from src.services.sleeping_market import SleepingMarketDetector, SleepingMarketInput
 from src.config.settings import settings
-from daily_limits import DailyLimitsManager, DailyLimitsConfig
+from src.daily_limits import DailyLimitsManager, DailyLimitsConfig
 
 
 
@@ -1753,7 +1753,7 @@ def decide_action(
 
 
     # 0.4 Clearing protection (ENTRIES blocked, but risk exits above are allowed)
-    if minutes_to_clearing <= 10:
+    if minutes_to_clearing <= 3:
         # If flat (no position) — do nothing
         if lots == 0:
             return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min)", metadata
@@ -1912,13 +1912,32 @@ def decide_action(
         # ========== 🚨 BIAS FILTER (ДОБАВЛЕНО) ==========
         bias_u = str(bias).upper().strip()
         
-        # SHORT_ONLY → блокировать любые BUY входы
-        if bias_u == "SHORT_ONLY" and ai_signal_u == "BUY":
-            return "NOOP", f"⛔ BIAS CONFLICT: SHORT_ONLY blocks BUY signal (conf={effective_confidence})", metadata
         
-        # LONG_ONLY → блокировать любые SELL входы
+        # SHORT_ONLY → блокировать BUY, но разрешить SHORT по технике
+        if bias_u == "SHORT_ONLY" and ai_signal_u == "BUY":
+            # ✅ При импульсе вниз разрешаем скальпинг шортом
+            market_state_val = str(data.get("market_state", "RANGE")).upper()
+            if market_state_val in ("IMPULSE_DOWN", "IMPULSEDOWN") and rsi > 15:
+                ai_signal_u = "SELL"
+                metadata["bias_override"] = "SHORT_ONLY: BUY→SELL (IMPULSE_SCALP mode)"
+                print(f"⚡ BIAS OVERRIDE: SHORT_ONLY + IMPULSE_DOWN → разрешён скальп-шорт (RSI={rsi:.1f})")
+            else:
+                return "NOOP", f"⛔ BIAS CONFLICT: SHORT_ONLY blocks BUY signal (conf={effective_confidence})", metadata
+
+        
+        
+        # LONG_ONLY → блокировать SELL, но разрешить LONG по технике (даже при AI SELL)
         if bias_u == "LONG_ONLY" and ai_signal_u == "SELL":
-            return "NOOP", f"⛔ BIAS CONFLICT: LONG_ONLY blocks SELL signal (conf={effective_confidence})", metadata
+            # ✅ При импульсе разрешаем скальпинг лонгом (игнорируем фундаментальный SELL)
+            market_state_val = str(data.get("market_state", "RANGE")).upper()
+            if market_state_val in ("IMPULSE_UP", "IMPULSEUP") and rsi < 85:
+                # Переключаем сигнал на BUY, но снижаем вес на 30%
+                ai_signal_u = "BUY"
+                metadata["bias_override"] = "LONG_ONLY: SELL→BUY (IMPULSE_SCALP mode)"
+                print(f"⚡ BIAS OVERRIDE: LONG_ONLY + IMPULSE_UP → разрешён скальп-лонг (RSI={rsi:.1f})")
+            else:
+                return "NOOP", f"⛔ BIAS CONFLICT: LONG_ONLY blocks SELL signal (conf={effective_confidence})", metadata
+
         
         # BEARISH → блокировать агрессивный BUY (кроме hedge)
         if bias_u == "BEARISH" and ai_signal_u == "BUY" and not is_bullish_hedge:
@@ -2688,6 +2707,7 @@ async def main_loop():
                     risk_mode=gwdd_mode,
                     ai_signal=news_result.signal,
                     rsi=rsi_val,
+                    market_state=data.get("market_state", "RANGE")
                 )
 
                 position_size = gwdd_engine.get_position_sizing(
@@ -2871,7 +2891,7 @@ async def main_loop():
                 
                 # 3) Clearing lock: за 30 минут до клиринга запрещаем увеличивать риск (|lots|)
                 minutes_to_clearing = get_minutes_to_clearing()
-                if minutes_to_clearing <= 10 and not is_risk_exit:
+                if minutes_to_clearing <= 3 and not is_risk_exit:
                     # Разрешаем только снижение позиции/закрытие, даже если trade_allowed=True
                     if not is_position_reduction and action not in ("BUYALL", "SELLALL"):
                         can_execute = False

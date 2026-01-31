@@ -294,12 +294,14 @@ class GWDDEngine:
 
     
     def decide_entry(
-        self,
-        entry_weight: float,
-        risk_mode: str = "MODERATE",
-        ai_signal: str = "HOLD",
-        rsi: float | None = None
+    self,
+    entry_weight: float,
+    risk_mode: str = "MODERATE",
+    ai_signal: str = "HOLD",
+    rsi: Optional[float] = None,
+    market_state: str = "RANGE"  # ✅ ДОБАВЛЕНО
     ) -> Tuple[bool, float, str]:
+
         """
         Decide whether to enter position based on entry weight
         GWDD v2: Adds MA5 and momentum checks
@@ -321,9 +323,13 @@ class GWDDEngine:
         #    return False, float(entry_weight), f"HOLD signal, weight={entry_weight:.2f}"
         
         # GWDD v2: Блокировка при резком падении веса (momentum < -0.05)
-        if momentum < -0.02:
-            return False, float(entry_weight), f"⛔ SKIP GWDD momentum collapse, momentum={momentum:.3f} <-0.02 (weight={entry_weight:.2f}, MA5={ma5:.2f})"
-
+        # Для импульсов допускаем более глубокую коррекцию momentum
+        
+        momentum_threshold = -0.05 if market_state == "IMPULSE" else -0.02
+        if momentum < momentum_threshold:
+            return False, float(entry_weight), f"⛔ SKIP GWDD momentum collapse, momentum={momentum:.3f} <{momentum_threshold:.2f} (weight={entry_weight:.2f}, MA5={ma5:.2f}, state={market_state})"
+                
+        
         # GWDD v2: Drift check (30-minute trend fading protection)
         if len(self.weight_history) >= 30:
             weight_30min_ago = self.weight_history[0]  # Самое старое значение в истории

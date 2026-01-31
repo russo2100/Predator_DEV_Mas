@@ -202,12 +202,16 @@ SYSTEM: Ты - Главный Стратег (Planner Agent) хедж-фонда
         ai_confidence = float(market_context.get("ai_confidence", 0))
 
         # --- 7) Определяем FORCE_WEIGHT на основе risk_mode ---
-        force_weight = 0.60  # Default для CONSERVATIVE
-
-        if base_risk == "NORMAL":
+        # ✅ Для импульсов снижаем порог для входа
+        if market_state in ("IMPULSE_UP", "IMPULSEUP", "IMPULSE_DOWN", "IMPULSEDOWN"):
+            force_weight = 0.35  # Импульсный режим - низкий порог
+        elif base_risk == "NORMAL":
             force_weight = 0.70
         elif base_risk == "AGGRESSIVE":
             force_weight = 0.50
+        else:  # CONSERVATIVE
+            force_weight = 0.60
+
 
         # 🔥 BOOST для высокой уверенности AI (≥80%)
         if ai_confidence >= 85:
