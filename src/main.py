@@ -1772,7 +1772,7 @@ def decide_action(
 
         
         if entry_time is not None:
-            hold_duration = (datetime.now() - entry_time).total_seconds() / 60  # минуты
+            hold_duration = (datetime.now() - datetime.fromtimestamp(entry_time)).total_seconds() / 60  # минуты
             
             if hold_duration < MIN_HOLD_MINUTES:
                 # Проверяем, это риск-выход или обычное закрытие
@@ -2234,7 +2234,6 @@ async def main_loop():
     risk_agent = RiskAgent()
     executor = MainOrderExecutor(token)
     news_agent = UnifiedNewsAgent()
-    weather_monitor = SynopticMonitor()
     sharedstate = SharedTradingState()
     atr_stop = ATRStopEngine()  # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
@@ -2351,8 +2350,6 @@ async def main_loop():
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
                 
-            # Регистрируем в Daily Limits
-                daily_limits.register_trade(pnl=realized_pnl)
 
 
 
@@ -2362,18 +2359,11 @@ async def main_loop():
                 atr_stop.on_close()
                 sharedstate.close_position()
                 print(f"✅ Position closed, entry_time reset")
+                daily_limits.register_trade(pnl=0.0)
 
             prev_lots = current_lots
             
-            # ========== REGISTER TRADE (П.5) ==========
-            if 'pnl_rub' in locals() or 'realized_pnl' in locals():
-                pnl = locals().get('pnl_rub', locals().get('realized_pnl', 0.0))
-                daily_limits.register_trade(pnl=pnl)
-           # ==========================================
-
-
-
-
+        
             # 2. Получение и анализ свечей
                     
             candles = await executor.get_candles_5m(ACTIVE_FIGI)
@@ -2714,7 +2704,7 @@ async def main_loop():
             # 8. Погода как фильтр
             trade_allowed = risk_allowed
             
-            if is_extreme:
+            if weather_data.get("is_extreme", False):
                 # Проверяем EXTREME OVERSOLD override
                 if rsi_val < 20 and news_result.bullish_prob > 0.20:
                     if weather_impact < 90:
@@ -2938,7 +2928,7 @@ async def main_loop():
   
                 # 2) Исполнение разрешено если:
                 # Определяем is_risk_exit ПЕРЕД can_execute
-                    is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
+                is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
 
                 # КРИТИЧНО: risk exits ВСЕГДА исполняются (даже если trade_allowed=False)
                 can_execute = (is_position_reduction and is_risk_exit) or trade_allowed
