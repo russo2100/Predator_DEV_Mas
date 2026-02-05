@@ -18,6 +18,7 @@ from src.core.pipeline import pipeline_analysis
 from t_tech.invest import AsyncClient, OrderDirection, OrderType, CandleInterval, Future
 from pathlib import Path
 import os
+from zoneinfo import ZoneInfo  # Для точного времени МСК
 from src.core.multi_agent_adapter import MultiAgentShadowAdapter
 from src.agents.planner import PlannerAgent
 from src.agents.risk_agent import RiskAgent
@@ -26,7 +27,6 @@ from src.core.gwdd_engine import GWDDEngine, GWDDConfig
 from src.shared_state import SharedTradingState
 import datetime as dt
 import pytz
-from src.services.weather_monitor import SynopticMonitor
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional
 import hashlib
@@ -1020,7 +1020,7 @@ class LLMMarketAnalystAdapter:
     "2. ТЕХНИКА: Цена={price}, RSI={rsi}, ATR={atr}, Тренд_5m={trend_5m} "
     "(UPTREND/DOWNTREND/FLAT).\n"
     "3. ВОЛАТИЛЬНОСТЬ: ATR={atr}. Если ATR>0.20 и RSI 30-70 → HOLD (шумный рынок).\n"
-    "4. ПОГОДА/СПРОС: {weather_str}.\n\n"
+    "4. ФУНДАМЕНТ/НОВОСТИ: {news}.\n\n"
     "ТВОЯ ТОРГОВАЯ СТРАТЕГИЯ:\n"
     "---------------------------------------------------\n"
     "СЦЕНАРИЙ 1: ФУНДАМЕНТАЛ = BULLISH (Рост)\n"
@@ -1524,6 +1524,7 @@ def decide_action(
     pnl_pct: float = 0.0,
     last_sl_exit_cycle: int = -999,
     current_cycle: int = 0,
+    sharedstate = None,
 ) -> Tuple[str, str, Dict[str, Any]]:
         
     """
@@ -1759,6 +1760,34 @@ def decide_action(
             return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min)", metadata
         # If in position — we already handled exits above; keep position
         return "NOOP", f"⏱️ Clearing protection ({minutes_to_clearing}min): hold position", metadata
+    
+    
+        # ---------- 0.5) MINIMUM HOLD TIME (15 minutes) ----------
+    # Блокируем закрытие позиции раньше 15 минут (кроме SL/TP/Emergency)
+    MIN_HOLD_MINUTES = 15
+    
+    if lots != 0:  # Если есть позиция
+        # Получаем время входа из SharedState
+        entry_time = sharedstate.entry_time if sharedstate else None
+
+        
+        if entry_time is not None:
+            hold_duration = (datetime.now() - entry_time).total_seconds() / 60  # минуты
+            
+            if hold_duration < MIN_HOLD_MINUTES:
+                # Проверяем, это риск-выход или обычное закрытие
+                is_risk_exit = metadata.get("is_risk_exit", False)
+                
+                if not is_risk_exit:
+                    # Блокируем обычное закрытие
+                    print(f"⏳ MIN_HOLD: position held {hold_duration:.1f}m / {MIN_HOLD_MINUTES}m (blocking exit)")
+                    metadata["min_hold_active"] = True
+                    metadata["hold_duration"] = hold_duration
+                    return "NOOP", f"MIN_HOLD: {hold_duration:.1f}m < {MIN_HOLD_MINUTES}m (keep position)", metadata
+                else:
+                    # Риск-выход разрешён (SL/TP/Emergency)
+                    print(f"⚠️ MIN_HOLD bypassed: risk exit at {hold_duration:.1f}m")
+
 
     # ---------- 1) Target delta bookkeeping ----------
     delta = target_lots - lots
@@ -1909,6 +1938,32 @@ def decide_action(
         # GWDD target из глобальной переменной
         target_lots = GWDD_TARGET_LOTS
         
+        
+        # ========== 🚨 FLAT TREND FILTER (НОВОЕ) ==========
+        # Блокировать новые входы во FLAT тренде (кроме экстремальных условий)
+        if trend_u == "FLAT":
+            # Исключения: разрешаем вход только при экстремальных RSI или IMPULSE market_state
+            allow_flat_entry = False
+            
+            # Исключение 1: Экстремальный RSI (mean reversion)
+            if rsi < 20 or rsi > 80:
+                allow_flat_entry = True
+                print(f"⚡ FLAT override: extreme RSI {rsi:.1f}")
+            
+            # Исключение 2: Market state показывает IMPULSE (несмотря на FLAT trend)
+            elif market_state_u in ("IMPULSE_UP", "IMPULSE_DOWN", "IMPULSEUP", "IMPULSEDOWN"):
+                allow_flat_entry = True
+                print(f"⚡ FLAT override: market_state={market_state_u}")
+            
+            # Исключение 3: Очень высокая уверенность AI (>85%) + сильная вероятность
+            elif effective_confidence >= 85 and (bullish_prob >= 0.80 or bearish_prob >= 0.80):
+                allow_flat_entry = True
+                print(f"⚡ FLAT override: AI conf {effective_confidence}%, prob {max(bullish_prob, bearish_prob):.0%}")
+            
+            if not allow_flat_entry:
+                return "NOOP", f"🚫 FLAT FILTER: no entry in FLAT trend (RSI={rsi:.1f}, conf={effective_confidence})", metadata
+        # ========== КОНЕЦ FLAT FILTER ==========
+        
         # ========== 🚨 BIAS FILTER (ДОБАВЛЕНО) ==========
         bias_u = str(bias).upper().strip()
         
@@ -2015,12 +2070,21 @@ def decide_action(
     delta = target_lots - lots
     metadata.update({"delta": delta, "target_lots": target_lots, "current_lots": lots})
 
+    # ========== GWDD DELTA REBALANCE (ПАТЧ: отключаем закрытие в RANGE) ==========
     if delta > 0:
         return f"BUY{abs(delta)}", f"GWDD Target{target_lots} cur{lots} BUY{abs(delta)}", metadata
+
     if delta < 0:
+        # ✅ НОВОЕ: В RANGE не закрываем позицию по GWDD target_lots=0
+        if market_state_u == "RANGE" and lots != 0 and target_lots == 0:
+            print(f"⚠️ GWDD_BLOCK disabled in RANGE: keep position {lots} lots (target was 0)")
+            return "NOOP", f"GWDD_BLOCK disabled in RANGE (keep {lots} lots)", metadata
+        
+        # В остальных случаях — разрешаем закрытие
         return f"SELL{abs(delta)}", f"GWDD Target{target_lots} cur{lots} SELL{abs(delta)}", metadata
 
     return "NOOP", f"Aligned {lots}={target_lots} B{bullish_prob:.2f}S{bearish_prob:.2f}RSI{rsi:.1f}", metadata
+
 
 
 
@@ -2239,6 +2303,13 @@ async def main_loop():
                 continue
 
             cycle += 1
+            # 🚫 Блокировка утренней сессии (9-12 МСК)
+            current_hour = datetime.now(ZoneInfo("Europe/Moscow")).hour
+            if 9 <= current_hour < 12:
+                logger.info(f"🚫 Morning session blocked (hour {current_hour}). Waiting...")
+                await asyncio.sleep(60)  # Проверять каждую минуту
+                continue
+            
             print(f"\n⏳ --- CYCLE {cycle:06d} | {now_msk.strftime('%H:%M:%S')} ---")
 
             # 1. Получение данных о позиции
@@ -2268,8 +2339,8 @@ async def main_loop():
                 sharedstate.position_direction = direction
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 sharedstate.p_high_since_entry = avg_price
-                sharedstate.entry_time = time_module.time()
-                sharedstate.p_low_since_entry = avg_price
+                          
+                print(f"✅ Position opened: {currentlots} lots @ {avgprice:.3f}, entry_time recorded")
 
             elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
                 direction = "LONG" if current_lots > 0 else "SHORT"
@@ -2289,12 +2360,8 @@ async def main_loop():
             elif prev_lots > 0 and current_lots == 0:
                 # Позиция полностью закрыта
                 atr_stop.on_close()
-                sharedstate.entry_time = None
-                sharedstate.sl_level = 0.0
-                sharedstate.atr_at_entry = 0.0
-                sharedstate.position_direction = ""
-                sharedstate.p_high_since_entry = 0.0
-                sharedstate.p_low_since_entry = 0.0
+                sharedstate.close_position()
+                print(f"✅ Position closed, entry_time reset")
 
             prev_lots = current_lots
             
@@ -2368,18 +2435,18 @@ async def main_loop():
 
                 st = atr_stop.get_state()
                 if st is not None:
-                    sharedstate.entry_price = st.entry_price
+                    
                     sharedstate.atr_at_entry = st.atr_at_entry
                     sharedstate.position_direction = st.direction
                     sharedstate.sl_level = st.sl_level
                     sharedstate.p_high_since_entry = st.p_high_since_entry
                     sharedstate.p_low_since_entry = st.p_low_since_entry
 
-                    sharedstate.entry_time = time_module.time()
+                    
             elif prev_lots > 0 and current_lots == 0:
                 atr_stop.on_close()
-                sharedstate.entry_time = None
-                sharedstate.sl_level = 0.0
+                
+                
                 sharedstate.atr_at_entry = 0.0
                 sharedstate.position_direction = ""
                 sharedstate.p_high_since_entry = 0.0
@@ -2455,19 +2522,19 @@ async def main_loop():
 
                 st = atr_stop.get_state()
                 if st is not None:
-                    sharedstate.entry_price = st.entry_price
+                    ce = st.entry_price
                     sharedstate.atr_at_entry = st.atr_at_entry
                     sharedstate.position_direction = st.direction
                     sharedstate.sl_level = st.sl_level
                     sharedstate.p_high_since_entry = st.p_high_since_entry
                     sharedstate.p_low_since_entry = st.p_low_since_entry
 
-                    sharedstate.entry_time = time_module.time()  # Сохраняем время открытия
+                    
             # Полное закрытие позиции
             elif prev_lots > 0 and current_lots == 0:
                 atr_stop.on_close()
-                sharedstate.entry_time = None
-                sharedstate.sl_level = 0.0
+                
+                
                 sharedstate.atr_at_entry = 0.0
                 sharedstate.position_direction = ""
                 sharedstate.p_high_since_entry = 0.0
@@ -2505,11 +2572,9 @@ async def main_loop():
 
 
 
-            # 3. Синоптический мониторинг (погода)
-            print("🌡️ Опрос метеослужб (Open-Meteo)...")
-            weather_data = await weather_monitor.get_weather_impact()
-            weather_str = weather_monitor.get_weather_context_str(weather_data)
-            print(f"📡 {weather_str}")
+            # Weather module removed - using external news only
+            weather_data = {"demand_impact_pct": 0, "arctic_blast_score": 0.0, "is_extreme": False}
+            weather_str = ""
 
             # 4. Фундаментал и новости (только news_fire.txt)
             manual_news = ""
@@ -2530,7 +2595,7 @@ async def main_loop():
             
             if cycle % 10 == 1 or last_news_result is None:
                 print("📰 NEWS_AGENT: Анализ новостей и фундамента (full refresh)...")
-                full_context = f"{weather_str}\nНОВОСТИ:\n{manual_news}"
+                full_context = f"НОВОСТИ:\n{manual_news}"
                 news_result = await analyst.analyze(
                     marketdata=data,
                     newscontext=full_context,
@@ -2647,13 +2712,7 @@ async def main_loop():
 
 
             # 8. Погода как фильтр
-            weather_allowed = True
-            block_reason = None
-            # === SMART WEATHER OVERRIDE ===
-            weather_impact = weather_data.get("demand_impact_pct", 0)
-            arctic_score = weather_data.get("arctic_blast_score", 0.0)
-            # FIX: убираем ложный extreme, если метрики не рассчитаны
-            is_extreme = bool(weather_data.get("is_extreme")) and (weather_impact > 0 or arctic_score > 0)
+            trade_allowed = risk_allowed
             
             if is_extreme:
                 # Проверяем EXTREME OVERSOLD override
@@ -2838,6 +2897,7 @@ async def main_loop():
                 pnl_pct=pnl_pct,
                 last_sl_exit_cycle=last_sl_exit_cycle,
                 current_cycle=cycle,
+                sharedstate=sharedstate,
             )
 
             # === SLEEPING MARKET FILTER ===
