@@ -2938,7 +2938,7 @@ async def main_loop():
   
                 # 2) Исполнение разрешено если:
                 # Определяем is_risk_exit ПЕРЕД can_execute
-                # is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
+                    is_risk_exit = isinstance(action_reason, str) and any(m in action_reason for m in ("ATR SL", "SL hit", "Emergency", "Clearing protection", "Clearing lock", "TP"))
 
                 # КРИТИЧНО: risk exits ВСЕГДА исполняются (даже если trade_allowed=False)
                 can_execute = (is_position_reduction and is_risk_exit) or trade_allowed
