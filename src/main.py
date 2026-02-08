@@ -7,6 +7,7 @@ from src.utils.jsonl_enrichment import enrich_cycle_event
 import re
 import json
 import uuid
+from dotenv import load_dotenv
 import aiohttp
 from typing import Dict, Any, Literal, Optional, Tuple
 from datetime import datetime, timedelta, timezone, time
@@ -30,7 +31,7 @@ import pytz
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional
 import hashlib
-
+from acontext import AcontextClient
 from dataclasses import dataclass
 from typing import List, Optional
 from pathlib import Path
@@ -43,7 +44,7 @@ from src.config.settings import settings
 from src.daily_limits import DailyLimitsManager, DailyLimitsConfig
 
 
-
+load_dotenv()
 
 MOEX_TZ = pytz.timezone("Europe/Moscow")
 
@@ -1971,7 +1972,7 @@ def decide_action(
         # SHORT_ONLY → блокировать BUY, но разрешить SHORT по технике
         if bias_u == "SHORT_ONLY" and ai_signal_u == "BUY":
             # ✅ При импульсе вниз разрешаем скальпинг шортом
-            market_state_val = str(data.get("market_state", "RANGE")).upper()
+            market_state_val = str(market_state).upper()
             if market_state_val in ("IMPULSE_DOWN", "IMPULSEDOWN") and rsi > 15:
                 ai_signal_u = "SELL"
                 metadata["bias_override"] = "SHORT_ONLY: BUY→SELL (IMPULSE_SCALP mode)"
@@ -1984,7 +1985,7 @@ def decide_action(
         # LONG_ONLY → блокировать SELL, но разрешить LONG по технике (даже при AI SELL)
         if bias_u == "LONG_ONLY" and ai_signal_u == "SELL":
             # ✅ При импульсе разрешаем скальпинг лонгом (игнорируем фундаментальный SELL)
-            market_state_val = str(data.get("market_state", "RANGE")).upper()
+            market_state_val = str(market_state).upper()
             if market_state_val in ("IMPULSE_UP", "IMPULSEUP") and rsi < 85:
                 # Переключаем сигнал на BUY, но снижаем вес на 30%
                 ai_signal_u = "BUY"
@@ -2182,12 +2183,123 @@ class ExecutionCooldownState:
         self.lastconfirmedlots = None
 
 
+# ========== ACONTEXT HELPER FUNCTIONS ==========
+def init_acontext_client():
+    """Инициализация Acontext client с fallback."""
+    acontext_enabled = os.getenv("ACONTEXT_ENABLED", "false").lower() == "true"
+    
+    if not acontext_enabled:
+        return None, None, False
+    
+    try:
+        client = AcontextClient(api_key=os.getenv("ACONTEXT_API_KEY"))
+        session = client.sessions.create()
+        print(f"✅ Acontext session created: {session.id}")
+        return client, session.id, True
+    except Exception as e:
+        print(f"⚠️ Acontext initialization failed: {e}")
+        return None, None, False
+
+
+def save_decision_to_acontext(
+    client,
+    session_id: str,
+    cycle: int,
+    action: str,
+    reason: str,
+    current_price: float,
+    rsi_val: float,
+    current_lots: int,
+    pnl_pct: float,
+    news_signal: str,
+    news_confidence: float,
+    planner_bias: str,
+    gwdd_weight: Optional[float],
+    metadata: dict
+):
+    """Сохранение решения цикла в Acontext."""
+    try:
+        decision_content = {
+            "cycle": cycle,
+            "timestamp": datetime.now(ZoneInfo("Europe/Moscow")).isoformat(),
+            "action": action,
+            "reason": reason,
+            "price": round(current_price, 3),
+            "rsi": round(rsi_val, 1),
+            "lots": current_lots,
+            "pnl_pct": round(pnl_pct, 2),
+            "ai_signal": news_signal,
+            "ai_confidence": news_confidence,
+            "planner_bias": planner_bias,
+            "gwdd_weight": round(gwdd_weight, 3) if gwdd_weight else None,
+            "metadata": metadata
+        }
+        
+        client.sessions.store_message(
+            session_id=session_id,
+            blob={
+                "role": "assistant",
+                "content": json.dumps(decision_content, ensure_ascii=False)
+            },
+            format="openai"
+        )
+    except Exception as e:
+        print(f"⚠️ Acontext save failed (cycle {cycle}): {e}")
+
+
+def get_acontext_summary(client, session_id: str, max_recent: int = 5) -> Optional[str]:
+    """Получить краткую историю последних циклов для контекста."""
+    try:
+        prev_messages = client.sessions.get_messages(
+            session_id=session_id,
+            format="openai",
+            edit_strategies=[
+                {
+                    "type": "token_limit",
+                    "params": {"limit_tokens": 2000}
+                }
+            ]
+        )
+        
+        if prev_messages.items:  # type: ignore
+            recent = prev_messages.items[-max_recent:]  # type: ignore
+            summaries = []
+            for msg in recent:
+                try:
+                    data = json.loads(msg['content'])  # type: ignore
+                    summaries.append(
+                        f"C{data['cycle']}: {data['action']} @ {data['price']} "
+                        f"(RSI={data['rsi']}, PnL={data['pnl_pct']}%)"
+                    )
+                except:
+                    summaries.append(msg['content'][:80])  # type: ignore
+            return "\n".join(summaries)
+        return None
+    except Exception as e:
+        print(f"⚠️ Acontext summary failed: {e}")
+        return None
+# ===============================================
+
+class TradingExecutor:
+    """Заглушка для TradingExecutor"""
+    def __init__(self, *args, **kwargs):
+        pass
+    
+    async def execute_trade(self, *args, **kwargs):
+        print("⚠️ TradingExecutor: заглушка, реальное исполнение не реализовано")
+        return None
+
 async def main_loop():
     
     from src.services.atr_stop import ATRStopEngine
-    from src.shared_state import SharedTradingState
+    
     
     sharedstate = SharedTradingState()
+    executor = TradingExecutor(...)
+    daily_limits = DailyLimitsManager(...)
+    
+    acontext_client, trading_session_id, acontext_enabled = init_acontext_client()
+    
     atr_stop = ATRStopEngine(ksl_uptrend=2.0, ksl_other=1.5, ksl_flat=3.5, m_be=1.0)   # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
         # ========== DAILY LIMITS MANAGER ==========
@@ -2234,7 +2346,7 @@ async def main_loop():
     risk_agent = RiskAgent()
     executor = MainOrderExecutor(token)
     news_agent = UnifiedNewsAgent()
-    sharedstate = SharedTradingState()
+    
     atr_stop = ATRStopEngine()  # Использует defaults: k_sl_uptrend=2.0, k_sl_other=1.5, m_be=1.0
 
     print("👻 Hybrid Architecture v2.0: Режим активного мониторинга запущен.")
@@ -2268,7 +2380,6 @@ async def main_loop():
                 print(f"⏰ История не найдена, entry_time установлен на текущее время")
     except Exception as e:
         print(f"⚠️ Ошибка init entry_time: {e}")
-
 
 
     while True:
@@ -2305,7 +2416,7 @@ async def main_loop():
             # 🚫 Блокировка утренней сессии (9-12 МСК)
             current_hour = datetime.now(ZoneInfo("Europe/Moscow")).hour
             if 9 <= current_hour < 12:
-                logger.info(f"🚫 Morning session blocked (hour {current_hour}). Waiting...")
+                print(f"🚫 Morning session blocked (hour {current_hour}). Waiting...")
                 await asyncio.sleep(60)  # Проверять каждую минуту
                 continue
             
@@ -2339,7 +2450,7 @@ async def main_loop():
                 sharedstate.sl_level = atr_stop.get_sl() or 0.0
                 sharedstate.p_high_since_entry = avg_price
                           
-                print(f"✅ Position opened: {currentlots} lots @ {avgprice:.3f}, entry_time recorded")
+                print(f"✅ Position opened: {current_lots} lots @ {avg_price:.3f}, entry_time recorded")
 
             elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
                 direction = "LONG" if current_lots > 0 else "SHORT"
@@ -2704,25 +2815,7 @@ async def main_loop():
             # 8. Погода как фильтр
             trade_allowed = risk_allowed
             
-            if weather_data.get("is_extreme", False):
-                # Проверяем EXTREME OVERSOLD override
-                if rsi_val < 20 and news_result.bullish_prob > 0.20:
-                    if weather_impact < 90:
-                        # Обычный холод → full override
-                        weather_allowed = True
-                        print(f"✅ WEATHER OVERRIDE: RSI {rsi_val:.1f} < 20 > Weather (impact {weather_impact}%)")
-                    else:
-                        # Критический шторм → partial override (половина лота)
-                        weather_allowed = True
-                        MAX_LOTS_ALLOWED = max(1, MAX_LOTS_ALLOWED // 2)
-                        print(f"⚠️ PARTIAL OVERRIDE: RSI {rsi_val:.1f} < 20 + CRITICAL Weather ({weather_impact}%) → 0.5x lots")
-                else:
-                    # Блокируем вход
-                    weather_allowed = False
-                    block_reason = f"WEATHER_ALERT: extreme conditions (impact {weather_impact}%, arctic {arctic_score:.2f}) -> block entries"
-                    print(f"🌡️ Weather Impact: {weather_impact}% | Arctic Score: {arctic_score:.2f}")
-            else:
-                weather_allowed = True
+            weather_allowed = True
             trade_allowed = risk_allowed and weather_allowed
 
             position_size = 0
@@ -2889,6 +2982,27 @@ async def main_loop():
                 current_cycle=cycle,
                 sharedstate=sharedstate,
             )
+            
+            
+            # Сохранить решение в Acontext
+            if acontext_enabled and acontext_client and trading_session_id:
+                save_decision_to_acontext(
+                    client=acontext_client,
+                    session_id=trading_session_id,
+                    cycle=cycle,
+                    action=action,
+                    reason=action_reason,
+                    current_price=current_price,
+                    rsi_val=rsi_val,
+                    current_lots=current_lots,
+                    pnl_pct=pnl_pct,
+                    news_signal=news_result.signal,
+                    news_confidence=news_result.confidence,
+                    planner_bias=final_bias,
+                    gwdd_weight=weight_final if 'weight_final' in locals() else None,
+                    metadata=decision_metadata
+                )
+            # ============================================
 
             # === SLEEPING MARKET FILTER ===
             # Блокируем новые активные входы, если рынок "спит"

@@ -88,3 +88,4 @@ audit/
 
 # backups
 *.bak.*
+src/main.py.backup_*
