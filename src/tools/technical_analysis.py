@@ -58,8 +58,8 @@ class TechnicalAnalysis:
             delta = close.diff()
             gain = delta.clip(lower=0)
             loss = -1 * delta.clip(upper=0)  # type: ignore
-            avg_gain = gain.rolling(window=14).mean()
-            avg_loss = loss.rolling(window=14).mean()
+            avg_gain = gain.ewm(com=13, adjust=False).mean()
+            avg_loss = loss.ewm(com=13, adjust=False).mean()
             rs = avg_gain / avg_loss
             df['RSI'] = 100 - (100 / (1 + rs))
             df['RSI'] = df['RSI'].fillna(50)

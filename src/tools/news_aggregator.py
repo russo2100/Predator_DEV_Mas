@@ -7,7 +7,6 @@ from t_tech.invest import AsyncClient
 from src.config.settings import settings
 from src.tools.eia_collector import EIACollector
 from src.tools.rss_collector import NewsCollector
-from src.tools.weather_collector import WeatherCollector
 
 logger = logging.getLogger(__name__)
 
@@ -23,7 +22,6 @@ class UnifiedNewsAgent:
     def __init__(self):
         self.eia = EIACollector()
         self.rss = NewsCollector()
-        self.weather = WeatherCollector()
 
     async def get_aggregated_sentiment_context(self, figi: str = None) -> str:
         """Собирает все данные и форматирует для news.txt"""
@@ -53,18 +51,8 @@ class UnifiedNewsAgent:
             logger.error(f"RSS error: {e}")
             parts.append("\n📰 Market News: ERROR")
 
-        # 3. Weather Alerts
-        try:
-            score, alerts = self.weather.get_arctic_blast_probability()
-            if score > 0:
-                parts.append(f"\n🌨️ Weather Risk: {score:.1%}")
-                for alert in alerts[:3]:
-                    parts.append(f"  - {alert}")
-            else:
-                parts.append("\n🌨️ Weather Risk: No severe alerts")
-        except Exception as e:
-            logger.error(f"Weather error: {e}")
-            parts.append("\n🌨️ Weather Risk: ERROR")
+        # Weather alerts currently disabled
+        pass
 
         return "\n".join(parts)
 

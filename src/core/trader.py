@@ -80,26 +80,39 @@ class MainOrderExecutor:
 
     async def place_order(self, figi: str, direction: str, quantity: int = 1):
         """Выставляет РЫНОЧНУЮ заявку"""
-        async with AsyncClient(self.token) as client:
-            account_id = await self._get_account_id(client)
+        if quantity <= 0:
+            print(f"⚠️ Ошибка: попытка выставить ордер с quantity={quantity}")
+            return None
 
-            tinkoff_direction = (
-                OrderDirection.ORDER_DIRECTION_BUY if direction == 'BUY'
-                else OrderDirection.ORDER_DIRECTION_SELL
-            )
+        for attempt in range(3):
+            try:
+                async with AsyncClient(self.token) as client:
+                    account_id = await asyncio.wait_for(self._get_account_id(client), timeout=5.0)
 
-            print(f"💸 Выставляю ордер {direction} на {quantity} лот(ов)...")
+                    tinkoff_direction = (
+                        OrderDirection.ORDER_DIRECTION_BUY if direction == 'BUY'
+                        else OrderDirection.ORDER_DIRECTION_SELL
+                    )
 
-            post_method = client.sandbox.post_sandbox_order if settings.SANDBOX_MODE else client.orders.post_order
+                    print(f"💸 Выставляю ордер {direction} на {quantity} лот(ов)... (попытка {attempt+1}/3)")
 
-            order = await post_method(
-                figi=figi,
-                quantity=quantity,
-                price=None,
-                direction=tinkoff_direction,
-                account_id=account_id,
-                order_type=OrderType.ORDER_TYPE_MARKET,
-                order_id=str(uuid.uuid4())
-            )
-            print(f"✅ Ордер исполнен. ID: {order.order_id}")
-            return order
+                    post_method = client.sandbox.post_sandbox_order if settings.SANDBOX_MODE else client.orders.post_order
+
+                    order = await asyncio.wait_for(post_method(
+                        figi=figi,
+                        quantity=quantity,
+                        price=None,
+                        direction=tinkoff_direction,
+                        account_id=account_id,
+                        order_type=OrderType.ORDER_TYPE_MARKET,
+                        order_id=str(uuid.uuid4())
+                    ), timeout=10.0)
+                    print(f"✅ Ордер исполнен. ID: {order.order_id}")
+                    return order
+            except asyncio.TimeoutError:
+                print(f"⚠️ Timeout при выставлении ордера (попытка {attempt+1}/3)")
+            except Exception as e:
+                print(f"⚠️ Ошибка при выставлении ордера: {e}")
+            await asyncio.sleep(2)
+        print("❌ Не удалось выставить ордер после 3 попыток")
+        return None

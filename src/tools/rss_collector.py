@@ -13,7 +13,7 @@ class NewsCollector:
         self.sources = [
             "https://oilprice.com/rss/main",
             "https://ru.investing.com/rss/commodities_Natural_Gas.rss",
-            "https://finance.yahoo.com/rss/industry/energy"
+            "https://finance.yahoo.com/rss/industry/energy",
             
             # СПЕЦИАЛИЗИРОВАННЫЕ (Погода и запасы - Драйверы!)
             "https://www.eia.gov/naturalgas/weekly/rss/ngweekly.xml", # Запасы США (EIA) - Критично!

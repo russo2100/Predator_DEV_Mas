@@ -21,7 +21,7 @@ class PlannerAgent:
         self.llm = ChatOpenAI(
             model=settings.AI_MODEL_PLANNER,
             temperature=0.1,
-            api_key=settings.OPENROUTER_API_KEY,
+            api_key=settings.OPENROUTER_API_KEY.get_secret_value(),
             base_url=settings.OPENROUTER_BASE_URL,
             timeout=30,
             request_timeout=30,

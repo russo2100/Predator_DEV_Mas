@@ -1681,18 +1681,11 @@ def decide_action(
     # ---------- 0) RISK EXITS FIRST (always win) ----------
     # 0.1 Take Profit 3-level system (1.5%, 3%, 5%)
     # TP1: partial close at 1.5% (50% position ONCE)
-    if lots != 0 and pnl_pct >= 1.5:
+    # TP3: full exit at 5.0% (trailing stop safety net)
+    if lots != 0 and pnl_pct >= 5.0:
         metadata["is_risk_exit"] = True
-        
-        # LONG: 5 lots → sell 50% = 2-3 lots at TP1
-        # SHORT: -5 lots → buy 50% = 2-3 lots at TP1
-        if abs(lots) >= 4:  # Close ~50% if position >= 4 lots
-            close_qty = max(1, abs(lots) // 2)  # 50% rounded
-            side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
-            return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.5%, partial close {close_qty} lots (~50%)", metadata
-        
-        # If 1-3 lots: hold for TP2/TP3 (don't micro-exit)
-        # Fall through to check TP2/TP3
+        side = "SELLALL" if lots > 0 else "BUYALL"
+        return side, f"✅ TP3 PnL{pnl_pct:.2f}% ≥5.0%, full exit (strong trend)", metadata
 
     # TP2: close remaining 50% at 3.0%
     if lots != 0 and pnl_pct >= 3.0:
@@ -1707,11 +1700,18 @@ def decide_action(
             side = "SELLALL" if lots > 0 else "BUYALL"
             return side, f"✅ TP2 PnL{pnl_pct:.2f}% ≥3.0%, full exit (1 lot)", metadata
 
-    # TP3: full exit at 5.0% (trailing stop safety net)
-    if lots != 0 and pnl_pct >= 5.0:
+    # TP1: close 50% at 1.5%
+    if lots != 0 and pnl_pct >= 1.5:
         metadata["is_risk_exit"] = True
-        side = "SELLALL" if lots > 0 else "BUYALL"
-        return side, f"✅ TP3 PnL{pnl_pct:.2f}% ≥5.0%, full exit (strong trend)", metadata
+        
+        # LONG: 5 lots → sell 50% = 2-3 lots at TP1
+        # SHORT: -5 lots → buy 50% = 2-3 lots at TP1
+        if abs(lots) >= 4:  # Close ~50% if position >= 4 lots
+            close_qty = max(1, abs(lots) // 2)  # 50% rounded
+            side = f"SELL{close_qty}" if lots > 0 else f"BUY{close_qty}"
+            return side, f"✅ TP1 PnL{pnl_pct:.2f}% ≥1.5%, partial close {close_qty} lots (~50%)", metadata
+        
+        # If 1-3 lots: hold for TP2/TP3 (don't micro-exit)
 
 
 
@@ -2290,7 +2290,7 @@ class TradingExecutor:
         return None
 
 async def main_loop():
-    
+    global ACTIVE_NG_CONTRACT, ACTIVE_FIGI, ACTIVE_TICKER, ACTIVE_UID
     from src.services.atr_stop import ATRStopEngine
     
     
@@ -2338,7 +2338,7 @@ async def main_loop():
     risk_mode_adjustments={
         "CONSERVATIVE": 0.5,
         "MODERATE": 1.0,
-        "AGGRESSIVE": 1.5
+        "AGGRESSIVE": 1.2
     }
     )
 
@@ -2384,6 +2384,17 @@ async def main_loop():
 
     while True:
         try:
+            # ========== AUTO-ROLLOVER CHECK ==========
+            new_contract = select_active_ng_contract(NG_CONTRACTS)
+            if new_contract and ACTIVE_FIGI and new_contract.figi != ACTIVE_FIGI:
+                print(f"🔄 ROLLOVER: Переключение контракта с {ACTIVE_TICKER} на {new_contract.code}!")
+                # TODO: Если есть открытая позиция по-старому контракту, надо закрыть!
+                
+            if new_contract:
+                ACTIVE_NG_CONTRACT = new_contract
+                ACTIVE_FIGI = new_contract.figi
+                ACTIVE_TICKER = new_contract.code
+                ACTIVE_UID = new_contract.uid
             # ===== per-cycle defaults (MUST be before any gate/continue) =====
             can_execute = False
             qty = 0
@@ -2434,45 +2445,7 @@ async def main_loop():
             
             
             
-            # === ATR STOP: OPEN/CLOSE DETECTION ===
-            if prev_lots == 0 and current_lots != 0:
-                # Открылась новая позиция
-                direction = "LONG" if current_lots > 0 else "SHORT"
-                atr_0 = float(data.get("ATR", 0.015)) if 'data' in locals() else 0.015
-                trend_5m = data.get("trend_5m", "FLAT") if 'data' in locals() else "FLAT"  # ✅ ДОБАВЛЕНО
-                
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0, trend=trend_5m)  # ✅ trend передан
-
-                # Синхронизируем с shared state
-                sharedstate.entry_price = avg_price
-                sharedstate.atr_at_entry = atr_0
-                sharedstate.position_direction = direction
-                sharedstate.sl_level = atr_stop.get_sl() or 0.0
-                sharedstate.p_high_since_entry = avg_price
-                          
-                print(f"✅ Position opened: {current_lots} lots @ {avg_price:.3f}, entry_time recorded")
-
-            elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
-                direction = "LONG" if current_lots > 0 else "SHORT"
-                atr_0 = float(data.get("ATR", 0.015)) if 'data' in locals() else 0.015
-                trend_5m = data.get("trend_5m", "FLAT") if 'data' in locals() else "FLAT"  # ✅ ДОБАВЛЕНО
-                
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_0, trend=trend_5m)  # ✅ trend передан
-                sharedstate.sl_level = atr_stop.get_sl() or 0.0
-                print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
-                
-
-
-
-                
-            elif prev_lots > 0 and current_lots == 0:
-                # Позиция полностью закрыта
-                atr_stop.on_close()
-                sharedstate.close_position()
-                print(f"✅ Position closed, entry_time reset")
-                daily_limits.register_trade(pnl=0.0)
-
-            prev_lots = current_lots
+            # (ATR stop blocks removed from here, properly handled after data fetch)
             
         
             # 2. Получение и анализ свечей
@@ -2527,144 +2500,46 @@ async def main_loop():
 
 
 
-            # ATR STOP: открытие / закрытие
-            if prev_lots == 0 and current_lots != 0:
-                direction = "LONG" if current_lots > 0 else "SHORT"  # ← ДИНАМИЧЕСКИЙ
-                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t, trend=trend_5m)
-
-
-
-                st = atr_stop.get_state()
-                if st is not None:
-                    
-                    sharedstate.atr_at_entry = st.atr_at_entry
-                    sharedstate.position_direction = st.direction
-                    sharedstate.sl_level = st.sl_level
-                    sharedstate.p_high_since_entry = st.p_high_since_entry
-                    sharedstate.p_low_since_entry = st.p_low_since_entry
-
-                    
-            elif prev_lots > 0 and current_lots == 0:
-                atr_stop.on_close()
-                
-                
-                sharedstate.atr_at_entry = 0.0
-                sharedstate.position_direction = ""
-                sharedstate.p_high_since_entry = 0.0
-                sharedstate.p_low_since_entry = 0.0
-
-            prev_lots = current_lots
-
-            # Если позиция уже открыта — просто подтягиваем стоп
-            if current_lots > 0:
-                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=data.get("trend", "FLAT"))
-                st = atr_stop.get_state()
-                if st is not None:
-                    sharedstate.sl_level = st.sl_level
-                    sharedstate.p_high_since_entry = st.p_high_since_entry
-                    sharedstate.p_low_since_entry = st.p_low_since_entry
-
-
-            
-            # Расчёт PnL: используем вариационную маржу из брокера (expected_yield)
-            # Расчёт PnL: два типа для фьючерсов
-            # 1) Session PnL — от клиринга (expected_yield от брокера)
-            # 2) Position PnL — от момента открытия текущей позиции
-            if current_lots != 0 and avg_price > 0:
-                # 1️⃣ SESSION PnL — накопленный с момента клиринга (из expected_yield)
-                expected_yield = pos.get("expected_yield", 0.0)
-                
-                if expected_yield != 0:
-                    position_value_rub = abs(current_lots * avg_price * 1000)  # 1 лот = 1000 MMBtu
-                    session_pnl_pct = (expected_yield / position_value_rub) * 100
-                else:
-                    session_pnl_pct = 0.0
-                
-                # 2️⃣ POSITION PnL — от момента открытия текущей позиции
-                if current_lots > 0:  # LONG
-                    position_pnl_pct = ((current_price - avg_price) / avg_price) * 100
-                else:  # SHORT
-                    position_pnl_pct = ((avg_price - current_price) / avg_price) * 100
-                
-                # Для совместимости: pnl_pct = session_pnl_pct (используется в старых местах)
-                pnl_pct = session_pnl_pct
-            else:
-                session_pnl_pct = 0.0
-                position_pnl_pct = 0.0
-                pnl_pct = 0.0
-
-                pnl_pct = 0.0
-
-            
-            
-            # Расчет времени удержания позиции
-            if sharedstate.entry_time is not None:
-                holding_hours = (time_module.time() - sharedstate.entry_time) / 3600
-                holding_hours = max(0.0, holding_hours)  # ✅ Никогда не отрицательный
-            else:
-                holding_hours = 0.0
-
-            rsi_val = float(data.get("RSI", 50.0))
-            trend_5m = data.get("trend", "FLAT")
-            current_volume = int(candles["volume"].iloc[-1]) if not candles.empty and "volume" in candles.columns else 0
-            avg_volume_20 = int(candles["volume"].tail(20).mean()) if len(candles) >= 20 and "volume" in candles.columns else 1
-            
-            
-            atr_t = float(data.get("ATR", 0.015))
-
-
             # === ATR STOP: OPEN/CLOSE & UPDATE ===
-            # Открытие новой позиции
             if prev_lots == 0 and current_lots != 0:
-                # TODO: когда появятся реальные шорты — добавить определение направления
                 direction = "LONG" if current_lots > 0 else "SHORT"
-
                 atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t, trend=trend_5m)
-
                 st = atr_stop.get_state()
                 if st is not None:
-                    ce = st.entry_price
                     sharedstate.atr_at_entry = st.atr_at_entry
                     sharedstate.position_direction = st.direction
                     sharedstate.sl_level = st.sl_level
                     sharedstate.p_high_since_entry = st.p_high_since_entry
                     sharedstate.p_low_since_entry = st.p_low_since_entry
+                    sharedstate.entry_price = avg_price
+                    print(f"✅ Position opened: {current_lots} lots @ {avg_price:.3f}")
 
-                    
-            # Полное закрытие позиции
-            elif prev_lots > 0 and current_lots == 0:
+            elif prev_lots != 0 and current_lots == 0:
                 atr_stop.on_close()
-                
-                
+                sharedstate.close_position()
                 sharedstate.atr_at_entry = 0.0
                 sharedstate.position_direction = ""
                 sharedstate.p_high_since_entry = 0.0
                 sharedstate.p_low_since_entry = 0.0
+                print(f"✅ Position closed, entry_time reset")
+                daily_limits.register_trade(pnl=0.0)
+
+            elif prev_lots != 0 and current_lots != 0 and sharedstate.sl_level == 0.0:
+                direction = "LONG" if current_lots > 0 else "SHORT"
+                atr_stop.on_open(direction=direction, entry_price=avg_price, atr_0=atr_t, trend=trend_5m)
+                sharedstate.sl_level = atr_stop.get_sl() or 0.0
+                print(f"🔄 ATR Stop восстановлен: SL={sharedstate.sl_level:.3f}")
 
             prev_lots = current_lots
 
             # Обновление стопа, если позиция открыта
             if current_lots != 0:
-                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=data.get("trend", "FLAT"))
+                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=trend_5m)
                 st = atr_stop.get_state()
                 if st is not None:
                     sharedstate.sl_level = st.sl_level
                     sharedstate.p_high_since_entry = st.p_high_since_entry
                     sharedstate.p_low_since_entry = st.p_low_since_entry
-
-            
-            # === ATR STOP: UPDATE SL ===
-            if current_lots != 0:
-                atr_t = float(data.get("ATR", 0.015))
-                atr_stop.on_update(price_t=current_price, atr_t=atr_t, trend=data.get("trend", "FLAT"))
-
-                st = atr_stop.get_state()
-                if st is not None:
-                    sharedstate.sl_level = st.sl_level
-                    sharedstate.atr_at_entry = st.atr_at_entry
-                    sharedstate.p_high_since_entry = st.p_high_since_entry
-                    sharedstate.p_low_since_entry = st.p_low_since_entry
-                    sharedstate.position_direction = st.direction
                     
             print(
                 f"💰 Price: {current_price:.3f} | RSI: {rsi_val:.1f} | "
@@ -2942,6 +2817,7 @@ async def main_loop():
 
             # ========== DAILY LIMITS CHECK (П.5) ==========
             # Проверяем ТОЛЬКО перед новыми входами (current_lots == 0)
+            action = None
             if current_lots == 0:
                 can_trade, limit_reason = daily_limits.can_trade()
                 
@@ -2958,30 +2834,31 @@ async def main_loop():
 
             # 9. DECISION_BLOCK
         
-            action, action_reason, decision_metadata = decide_action(
-                lots=current_lots,
-                target_lots=target_lots_signed,
-                max_lots=MAX_LOTS_ALLOWED,
-                ai_signal=news_result.signal,
-                ai_confidence=news_result.confidence,
-                bullish_prob=news_result.bullish_prob,
-                bearish_prob=news_result.bearish_prob,
-                trend_5m=trend_5m,
-                rsi=rsi_val,
-                bias=final_bias,
-                rules=plan_result,
-                market_state=data.get("marketstate", "RANGE"),
-                minutes_to_clearing=get_minutes_to_clearing(),
-                current_volume=current_volume,
-                avg_volume=avg_volume_20,
-                atr=data.get("ATR", 0.15),
-                current_price=current_price,
-                sl_level=sharedstate.sl_level,
-                pnl_pct=pnl_pct,
-                last_sl_exit_cycle=last_sl_exit_cycle,
-                current_cycle=cycle,
-                sharedstate=sharedstate,
-            )
+            if action != "NOOP":
+                action, action_reason, decision_metadata = decide_action(
+                    lots=current_lots,
+                    target_lots=target_lots_signed,
+                    max_lots=MAX_LOTS_ALLOWED,
+                    ai_signal=news_result.signal,
+                    ai_confidence=news_result.confidence,
+                    bullish_prob=news_result.bullish_prob,
+                    bearish_prob=news_result.bearish_prob,
+                    trend_5m=trend_5m,
+                    rsi=rsi_val,
+                    bias=final_bias,
+                    rules=plan_result,
+                    market_state=data.get("marketstate", "RANGE"),
+                    minutes_to_clearing=get_minutes_to_clearing(),
+                    current_volume=current_volume,
+                    avg_volume=avg_volume_20,
+                    atr=data.get("ATR", 0.15),
+                    current_price=current_price,
+                    sl_level=sharedstate.sl_level,
+                    pnl_pct=pnl_pct,
+                    last_sl_exit_cycle=last_sl_exit_cycle,
+                    current_cycle=cycle,
+                    sharedstate=sharedstate,
+                )
             
             
             # Сохранить решение в Acontext

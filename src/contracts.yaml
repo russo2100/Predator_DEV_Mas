@@ -2,28 +2,39 @@ ng_futures:
   base_ticker: "NG"
   market: "MOEX_FORTS"
   contracts:
-    
-    - code: "NRG6"
-      figi: "FUTNGM022600"
-      uid: "2e05f080-9642-44e5-931d-fc8299e4e5ac"
-      month: 2
+    - code: "NRN6"
+      figi: "FUTNGM072600"
+      uid: ""
+      month: 7
       year: 2026
-      expiry_date: "2026-02-26T11:05:00+03:00"
-    - code: "NRH6"
-      figi: "FUTNGM032600"
-      uid: "77ab672d-e7f4-4b9a-b02d-c9d405576a48"
-      month: 3
+      expiry_date: "2026-07-28T18:00:00+03:00"
+    - code: "NRQ6"
+      figi: "FUTNGM082600"
+      uid: ""
+      month: 8
       year: 2026
-      expiry_date: "2026-03-26T11:05:00+03:00"
-    - code: "NRJ6"
-      figi: "FUTNGM042600"
-      uid: "04b4c8f7-ede5-4450-95af-5c3af8ed641d"
-      month: 4
+      expiry_date: "2026-08-27T18:00:00+03:00"
+    - code: "NRU6"
+      figi: "FUTNGM092600"
+      uid: ""
+      month: 9
       year: 2026
-      expiry_date: "2026-04-24T11:05:00+03:00"
-    - code: "NRK6"
-      figi: "FUTNGM052600"
-      uid: "6800f624-45d2-41cb-b376-d02b3d625b8a"
-      month: 5
+      expiry_date: "2026-09-25T18:00:00+03:00"
+    - code: "NRV6"
+      figi: "FUTNGM102600"
+      uid: ""
+      month: 10
       year: 2026
-      expiry_date: "2026-05-27T11:05:00+03:00"
+      expiry_date: "2026-10-27T18:00:00+03:00"
+    - code: "NRX6"
+      figi: "FUTNGM112600"
+      uid: ""
+      month: 11
+      year: 2026
+      expiry_date: "2026-11-26T18:00:00+03:00"
+    - code: "NRZ6"
+      figi: "FUTNGM122600"
+      uid: ""
+      month: 12
+      year: 2026
+      expiry_date: "2026-12-29T18:00:00+03:00"

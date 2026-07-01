@@ -19,6 +19,19 @@ class MarketSchedule:
 
         # 2. Проверка времени
         current_time = now_msk.time()
+        
+        # Проверка клирингов
+        day_clearing_start = time(14, 0)
+        day_clearing_end = time(14, 5)
+        eve_clearing_start = time(18, 45)
+        eve_clearing_end = time(19, 0)
+        
+        if day_clearing_start <= current_time < day_clearing_end:
+            return False
+            
+        if eve_clearing_start <= current_time < eve_clearing_end:
+            return False
+
         if self.start_time <= current_time <= self.end_time:
             return True
 

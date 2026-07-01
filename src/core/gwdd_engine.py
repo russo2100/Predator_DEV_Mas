@@ -256,6 +256,16 @@ class GWDDEngine:
             "record low": 0.12,
             "blackout": 0.10,
             "outage": 0.08,
+            "заморозки": 0.15,
+            "похолодание": 0.15,
+            "ураган": 0.10,
+            "перебои": 0.10,
+            "украина": 0.10,
+            "газопровод": 0.08,
+            "шторм": 0.08,
+            "забастовка": 0.08,
+            "отключение": 0.10,
+            "экстремальный холод": 0.12,
         }
         
         # Bearish keywords (demand decrease / supply increase)
@@ -264,6 +274,10 @@ class GWDDEngine:
             "production surge": -0.15,
             "export ban": -0.12,
             "oversupply": -0.10,
+            "потепление": -0.10,
+            "рост добычи": -0.15,
+            "запрет экспорта": -0.12,
+            "избыток": -0.10,
         }
         
         news_lower = news_text.lower()
@@ -375,13 +389,6 @@ class GWDDEngine:
             reason = (
                 f"ENTER: weight={entry_weight:.2f}, MA5={ma5:.2f}, "
                 f"momentum={momentum:.3f}, threshold={min_weight:.2f}, mode={mode}"
-            )
-        elif entry_weight >= min_weight:
-            # Старая логика: прошёл по весу, но НЕ прошёл по GWDD v2
-            should_enter = True
-            reason = (
-                f"ENTER: weight={entry_weight:.2f}, "
-                f"threshold={min_weight:.2f}, mode={mode}"
             )
         else:
             should_enter = False

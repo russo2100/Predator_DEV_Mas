@@ -12,13 +12,17 @@ class EIADataSource:
     
     async def get_series_data(self, series_id: str, start_date: str = None, end_date: str = None) -> Optional[Dict[str, Any]]:
         """Получение данных по series_id"""
+        now = datetime.now()
+        end_d = end_date or now.strftime("%Y-%m-%d")
+        start_d = start_date or (now - timedelta(days=180)).strftime("%Y-%m-%d")
+        
         params = {
             "api_key": self.api_key,
             "series_id": series_id,
             "data": "value",
             "frequency": "monthly",
-            "start": start_date or "2025-04-01",
-            "end": end_date or "2025-10-31"
+            "start": start_d,
+            "end": end_d
         }
         
         try:
