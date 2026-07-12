@@ -3,6 +3,12 @@
 import sys
 from pathlib import Path
 
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
 # Добавить корень проекта в sys.path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
