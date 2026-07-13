@@ -2459,6 +2459,13 @@ async def main_loop():
             data = pipeline_analysis(candles, "NRF6")
             current_price = float(data["close"])
             atr_t = float(data.get("ATR", 0.015))
+            current_volume = float(data.get("volume", 0.0))
+            avg_volume_20 = float(data.get("avg_volume_20", 0.0))
+            
+            pnl_pct = 0.0
+            if current_lots != 0 and avg_price > 0:
+                pnl_pct = (current_price - avg_price) / avg_price * 100 * (1 if current_lots > 0 else -1)
+            position_pnl_pct = pnl_pct
             
             sleeping_detector = SleepingMarketDetector()
 

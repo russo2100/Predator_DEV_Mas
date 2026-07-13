@@ -135,7 +135,7 @@ class MultiAgentShadowAdapter:
             analyst_task = asyncio.create_task(asyncio.sleep(0, result=analyst_payload))
 
             # --- Risk: локальная оценка/правила (как реализовано в RiskAgent) ---
-            risk_task = asyncio.create_task(self.safecall(self.risk.assessrisk, agent_state))
+            risk_task = asyncio.create_task(self.safecall(self.risk.assess_risk_shadow, agent_state))
 
             planner_res, analyst_res, risk_res = await asyncio.gather(planner_task, analyst_task, risk_task)
 
