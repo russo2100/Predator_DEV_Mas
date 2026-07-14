@@ -1,4 +1,6 @@
 import asyncio
+import os
+os.environ["USE_DEFAULT_ENUM_IF_ERROR"] = "true"
 import pandas as pd
 import numpy as np
 import json
@@ -199,6 +201,7 @@ consecutive_sell_signals = 0  # Счётчик последовательных 
 sell_signals_history = []     # История Confidence для SELL (последние 5)
 last_news_result = None      # Кэш результата NEWS_AGENT
 news_cache_cycle = 0         # Номер цикла последнего обновления
+last_news_mtime = 0.0        # Время последнего изменения файла news_fire.txt
 last_sleep_log_time: Optional[dt.datetime] = None
 
 # ========== SESSION ID & JSONL ==========
@@ -997,10 +1000,10 @@ class LLMMarketAnalystAdapter:
     def __init__(self):
         key = settings.OPENROUTER_API_KEY.get_secret_value()
         self.llm = ChatOpenAI(
-            model=settings.AI_MODEL_ANALYST,
+            model="gemini-1.5-flash",
             temperature=0.0,  # Строгость ответов
-            api_key=key,  # type: ignore
-            base_url=settings.OPENROUTER_BASE_URL,
+            api_key=os.environ.get("GEMINI_API_KEY", settings.OPENROUTER_API_KEY.get_secret_value()),
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
             model_kwargs={"response_format": {"type": "json_object"}},
             timeout=30,  # ← ДОБАВИТЬ TIMEOUT 30 СЕКУНД
             max_retries=2,  # ← ДОБАВИТЬ RETRY
@@ -1396,6 +1399,7 @@ def log_decision_block(
     daily_pnl_total: float = 0.0,
     daily_trades_remaining: int = 15,
     daily_limit_blocked: bool = False,
+    news_context: str = "",
 ):
 
     """
@@ -1476,6 +1480,7 @@ def log_decision_block(
         "daily_trades_remaining": daily_trades_remaining,
         "daily_limit_blocked": daily_limit_blocked,
         "position_pnl_pct": position_pnl_pct,
+        "news_context": news_context,
     }
     
     # 3. Запись в JSONL (дефолтный путь без LOGS_DIR)
@@ -2361,6 +2366,10 @@ async def main_loop():
     last_sl_exit_price = 0.0   # Цена выхода по SL
     SL_COOLDOWN_CYCLES = 3     # Минимум циклов до повторного входа после SL
     
+    global last_planner_result, last_planner_time
+    last_planner_result = None
+    last_planner_time = 0.0
+    
     
    
     # Инициализация entry_time при старте, если позиция открыта
@@ -2409,10 +2418,10 @@ async def main_loop():
 
             now_msk = dt.datetime.now(pytz.timezone("Europe/Moscow"))
 
-            # Блокируем торговлю до 09:00 МСК (аукцион открытия, гэпы)
-            if now_msk.hour < 9:
+            # Блокируем торговлю до 10:00 МСК (аукцион открытия, гэпы)
+            if now_msk.hour < 10:
                 if cycle == 0 or cycle % 10 == 0:
-                    print(f"⏸ PRE-MARKET WINDOW: {now_msk.strftime('%H:%M:%S')} < 09:00 MSK, waiting...")
+                    print(f"⏸ PRE-MARKET WINDOW: {now_msk.strftime('%H:%M:%S')} < 10:00 MSK, waiting...")
                 await asyncio.sleep(60)
                 continue
 
@@ -2424,12 +2433,6 @@ async def main_loop():
                 continue
 
             cycle += 1
-            # 🚫 Блокировка утренней сессии (9-12 МСК)
-            current_hour = datetime.now(ZoneInfo("Europe/Moscow")).hour
-            if 9 <= current_hour < 12:
-                print(f"🚫 Morning session blocked (hour {current_hour}). Waiting...")
-                await asyncio.sleep(60)  # Проверять каждую минуту
-                continue
             
             print(f"\n⏳ --- CYCLE {cycle:06d} | {now_msk.strftime('%H:%M:%S')} ---")
 
@@ -2573,21 +2576,37 @@ async def main_loop():
             rules = parse_trading_rules_from_news()
             current_bias = rules.get("bias", "neutral")
             
-            # 5. NEWS_AGENT анализирует новости + техничку (кэш: обновление раз в 10 циклов)
-            global last_news_result, news_cache_cycle
+            # 5. NEWS_AGENT анализирует новости + техничку
+            global last_news_result, news_cache_cycle, last_news_mtime
             
-            if cycle % 10 == 1 or last_news_result is None:
-                print("📰 NEWS_AGENT: Анализ новостей и фундамента (full refresh)...")
-                full_context = f"НОВОСТИ:\n{manual_news}"
+            # Чтение времени изменения файла news_fire.txt
+            news_file_path = "news_fire.txt"
+            current_news_mtime = 0.0
+            if os.path.exists(news_file_path):
+                current_news_mtime = os.path.getmtime(news_file_path)
+            
+            # Точные часы запуска (10:00 или 18:00 МСК)
+            is_scheduled_time = now_msk.hour in (10, 18) and now_msk.minute == 0
+            
+            full_context = f"НОВОСТИ:\n{manual_news}"
+            if current_news_mtime != last_news_mtime or is_scheduled_time or last_news_result is None:
+                reason = "full refresh"
+                if current_news_mtime != last_news_mtime and last_news_mtime != 0.0:
+                    reason = "news file updated"
+                elif is_scheduled_time:
+                    reason = f"scheduled time {now_msk.strftime('%H:%M')}"
+                
+                print(f"📰 NEWS_AGENT: Анализ новостей и фундамента ({reason})...")
                 news_result = await analyst.analyze(
                     marketdata=data,
                     newscontext=full_context,
                     bias=current_bias,
                 )
                 last_news_result = news_result
+                last_news_mtime = current_news_mtime
                 news_cache_cycle = cycle
             else:
-                print(f"📰 NEWS_AGENT: Используется кэш (цикл {news_cache_cycle}, след обновление через {10 - (cycle % 10)} циклов)...")
+                print("📰 NEWS_AGENT: Используется кэш (ожидание изменения файла новостей или расписания 10:00/18:00)...")
                 news_result = last_news_result
 
             print(f"🤖 AI: {news_result.signal} | Conf: {news_result.confidence}%")
@@ -2642,52 +2661,53 @@ async def main_loop():
                 "news_summary": manual_news[:500],
                 "ai_confidence": ai_confidence,
             }
-          
-            print("🧠 PLANNER: Синтез торговой стратегии...")
-            # --- PLANNER CONTEXT SAFE DEFAULTS ---
-            trend_h1 = trend_5m
-            trend_d1 = trend_5m
-
-            market_context = {
-                "ticker": "NG",
-
-               
-                "trend_5m": trend_5m,
-                "trend_h1": locals().get("trend_h1", trend_5m),
-                "trend_d1": locals().get("trend_d1", trend_5m),
-
-                # критично для override на импульсе/режиме рынка
-                "market_state": data.get("market_state", data.get("marketstate","RANGE")),   # или data.get("marketstate")
-
-                "news_summary": manual_news[:500],
-            }
             
+            # --- PLANNER GATING ---
+            run_planner = False
+            current_timestamp = now_msk.timestamp()
+            
+            if last_planner_result is None:
+                run_planner = True
+            elif news_cache_cycle == cycle:  # Если Analyst только что отработал (сменились новости или 10:00/18:00)
+                run_planner = True
+            elif (current_timestamp - last_planner_time) >= 3600: # Прошел 1 час
+                run_planner = True
 
-            try:
-                plan_result = await asyncio.wait_for(
-                    asyncio.to_thread(planner.create_plan, market_context),
-                    timeout=30,  # ← УВЕЛИЧЕНО с 20 до 30
-                )
-            except asyncio.TimeoutError:
-                print("⚠️ PLANNER TIMEOUT (30s) -> fallback CONSERVATIVE")
-                plan_result = {
-                    "bias": "NEUTRAL",  # ← Более безопасный fallback (вместо current_bias)
-                    "risk_mode": "CONSERVATIVE",  # ← Добавлено (для совместимости)
-                    "mode": "CONSERVATIVE",
-                    "strategy": "NEUTRAL",
-                    "reason": "planner timeout",
-                    "force_weight": 0.55,  # ← КРИТИЧНО: чтобы проходил порог CONSERVATIVE
-                }
-            except Exception as e:
-                print(f"⚠️ PLANNER ERROR -> fallback CONSERVATIVE: {e}")
-                plan_result = {
-                    "bias": "NEUTRAL",  # ← Более безопасный fallback
-                    "risk_mode": "CONSERVATIVE",
-                    "mode": "CONSERVATIVE",
-                    "strategy": "NEUTRAL",
-                    "reason": f"planner error: {e}",
-                    "force_weight": 0.55,  # ← КРИТИЧНО
-                }
+            if run_planner:
+                print("🧠 PLANNER: Синтез торговой стратегии (LLM Запрос)...")
+                try:
+                    plan_result = await asyncio.wait_for(
+                        asyncio.to_thread(planner.create_plan, market_context),
+                        timeout=30,
+                    )
+                    last_planner_result = plan_result
+                    last_planner_time = current_timestamp
+                except asyncio.TimeoutError:
+                    print("⚠️ PLANNER TIMEOUT (30s) -> fallback CONSERVATIVE")
+                    plan_result = {
+                        "bias": "NEUTRAL",
+                        "risk_mode": "CONSERVATIVE",
+                        "mode": "CONSERVATIVE",
+                        "strategy": "NEUTRAL",
+                        "reason": "planner timeout",
+                        "force_weight": 0.55,
+                    }
+                    last_planner_result = plan_result
+                except Exception as e:
+                    print(f"⚠️ PLANNER ERROR -> fallback CONSERVATIVE: {e}")
+                    plan_result = {
+                        "bias": "NEUTRAL",
+                        "risk_mode": "CONSERVATIVE",
+                        "mode": "CONSERVATIVE",
+                        "strategy": "NEUTRAL",
+                        "reason": f"planner error: {e}",
+                        "force_weight": 0.55,
+                    }
+                    last_planner_result = plan_result
+            else:
+                mins_ago = (current_timestamp - last_planner_time) / 60
+                print(f"🧠 PLANNER: Используется стратегия из кэша ({mins_ago:.1f} мин. назад)...")
+                plan_result = last_planner_result
 
             print(f"🧠 PLANNER RESULT: mode={plan_result.get('mode')} bias={plan_result.get('bias')} reason={plan_result.get('reason','')}")
 
@@ -2867,6 +2887,25 @@ async def main_loop():
                     sharedstate=sharedstate,
                 )
             
+            # --- EIA Thursday Blackout ---
+            now_et = dt.datetime.now(ZoneInfo("US/Eastern"))
+            if now_et.weekday() == 3 and dt.time(10, 0) <= now_et.time() <= dt.time(10, 45):
+                if current_lots != 0 and pnl_pct > 0:
+                    action = "SELLALL" if current_lots > 0 else "BUYALL"
+                    action_reason = "Emergency: EIA Report Liquidation"
+                    print(f"⚠️ EIA Report Liquidation: Закрываю позицию {current_lots} (PnL: {pnl_pct:.2f}%)")
+                    trade_allowed = True
+                else:
+                    is_reduction = False
+                    if current_lots > 0 and (action == "SELLALL" or action.startswith("SELL")):
+                        is_reduction = True
+                    elif current_lots < 0 and (action == "BUYALL" or action.startswith("BUY")):
+                        is_reduction = True
+                        
+                    if not is_reduction:
+                        action = "NOOP"
+                        action_reason = "EIA Thursday Blackout window (10:00 - 10:45 ET)"
+                        trade_allowed = False
             
             # Сохранить решение в Acontext
             if acontext_enabled and acontext_client and trading_session_id:
@@ -3140,6 +3179,7 @@ async def main_loop():
                 daily_pnl_total=daily_limits.realized_pnl_today,
                 daily_trades_remaining=daily_limits_config.MAX_TRADES_PER_DAY - daily_limits.trades_today,
                 daily_limit_blocked=decision_metadata.get("daily_limit_blocked", False),
+                news_context=full_context,
             )
 
             

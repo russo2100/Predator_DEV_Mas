@@ -1,4 +1,5 @@
 # src/agents/analyst.py
+import os
 import json
 import logging
 from typing import Any

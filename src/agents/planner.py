@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import os
 import json
 import re
 from typing import Any, Dict
@@ -28,24 +29,19 @@ class PlannerAgent:
             model_kwargs={"response_format": {"type": "json_object"}},
         )
 
-    # ---- Совместимость с ShadowAdapter ----
-    def createplan(self, agent_state: Dict[str, Any]) -> Dict[str, Any]:
+    def create_plan(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
-        ShadowAdapter вызывает planner.createplan(agent_state).
+        Универсальный метод: принимает market_context (main loop) или agent_state (shadow mode).
         """
         market_context: Dict[str, Any] = {
-            "ticker": agent_state.get("ticker", "NG"),
-            "trend_d1": agent_state.get("trend_d1", "UNKNOWN"),
-            "trend_h1": agent_state.get("trendh1", agent_state.get("trend_h1", "UNKNOWN")),
-            "trend_5m": agent_state.get("trend_5m", agent_state.get("trend5m", "UNKNOWN")),
-            "market_state": agent_state.get("market_state", agent_state.get("marketstate", "UNKNOWN")),
-            "news_summary": agent_state.get("newssummary", agent_state.get("news_summary", "")),
-            "ai_confidence": agent_state.get("ai_confidence", 0),
+            "ticker": data.get("ticker", "NG"),
+            "trend_d1": data.get("trend_d1", "UNKNOWN"),
+            "trend_h1": data.get("trend_h1", data.get("trendh1", "UNKNOWN")),
+            "trend_5m": data.get("trend_5m", data.get("trend5m", "UNKNOWN")),
+            "market_state": data.get("market_state", data.get("marketstate", "UNKNOWN")),
+            "news_summary": data.get("news_summary", data.get("newssummary", "")),
+            "ai_confidence": data.get("ai_confidence", 0),
         }
-
-        return self.create_daily_plan(market_context)
-
-    def create_plan(self, market_context: Dict[str, Any]) -> Dict[str, Any]:
         return self.create_daily_plan(market_context)
 
     def create_daily_plan(self, market_context: Dict[str, Any]) -> Dict[str, Any]:

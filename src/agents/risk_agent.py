@@ -30,15 +30,21 @@ class RiskAgent:
         # Exit policy
         self.ALLOW_EXIT_ALWAYS: bool = True
 
-    def assess_risk(self, alpha_signal: Dict[str, Any], market_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Основной метод для main loop"""
+    def assess_risk(self, *args, **kwargs) -> Dict[str, Any]:
+        """Основной метод для main loop и Shadow mode (принимает kwargs или positional)"""
+        if len(args) == 1 or "agent_state" in kwargs:
+            agent_state = args[0] if args else kwargs["agent_state"]
+            return self._assess_shadow(agent_state)
+            
+        alpha_signal = kwargs.get("alpha_signal") or (args[0] if len(args) > 0 else {})
+        market_data = kwargs.get("market_data") or (args[1] if len(args) > 1 else {})
         return self.evaluate_trade(alpha_signal=alpha_signal, market_data=market_data)
 
-    def assess_risk_shadow(self, agent_state: Dict[str, Any]) -> Dict[str, Any]:
-        """Альтернативный метод для Shadow mode (risk.assess_risk(agent_state))"""
-        signal = agent_state.get("ai_signal", agent_state.get("ai_signal", "HOLD"))
-        conf = agent_state.get("ai_confidence", agent_state.get("ai_confidence", 0))
-        reason = agent_state.get("ai_reason", agent_state.get("ai_reason", "Shadow mode default"))
+    def _assess_shadow(self, agent_state: Dict[str, Any]) -> Dict[str, Any]:
+        """Альтернативный метод для Shadow mode"""
+        signal = agent_state.get("ai_signal", "HOLD")
+        conf = agent_state.get("ai_confidence", 0)
+        reason = agent_state.get("ai_reason", "Shadow mode default")
 
         alpha_signal = {
             "signal": str(signal).upper(),
@@ -53,8 +59,9 @@ class RiskAgent:
             "ATR": self.to_float(atr, default=0.0),
             "RSI": self.to_float(rsi, default=50.0),
             "ticker": agent_state.get("ticker", "UNKNOWN"),
-            "ATR_SL": agent_state.get("ATR_SL", agent_state.get("ATR_SL")),
-            "ATR_TP": agent_state.get("ATR_TP", agent_state.get("ATR_TP")),
+            "ATR_SL": agent_state.get("ATR_SL"),
+            "ATR_TP": agent_state.get("ATR_TP"),
+            "market_state": agent_state.get("market_state", "RANGE"),
         }
 
         return self.evaluate_trade(alpha_signal=alpha_signal, market_data=market_data)

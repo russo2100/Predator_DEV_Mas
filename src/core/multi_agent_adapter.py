@@ -120,7 +120,7 @@ class MultiAgentShadowAdapter:
             )
 
             if planner_due:
-                planner_task = asyncio.create_task(self.safecall(self.planner.createplan, agent_state))
+                planner_task = asyncio.create_task(self.safecall(self.planner.create_plan, agent_state))
             else:
                 # мгновенный "task" с результатом из кэша
                 planner_task = asyncio.create_task(asyncio.sleep(0, result=self.planner_cache.plan))
@@ -135,7 +135,7 @@ class MultiAgentShadowAdapter:
             analyst_task = asyncio.create_task(asyncio.sleep(0, result=analyst_payload))
 
             # --- Risk: локальная оценка/правила (как реализовано в RiskAgent) ---
-            risk_task = asyncio.create_task(self.safecall(self.risk.assess_risk_shadow, agent_state))
+            risk_task = asyncio.create_task(self.safecall(self.risk.assess_risk, agent_state))
 
             planner_res, analyst_res, risk_res = await asyncio.gather(planner_task, analyst_task, risk_task)
 
@@ -155,8 +155,15 @@ class MultiAgentShadowAdapter:
                 },
             }
 
+            def _custom_encoder(obj: Any) -> Any:
+                if hasattr(obj, "model_dump"):
+                    return obj.model_dump()
+                if hasattr(obj, "dict"):
+                    return obj.dict()
+                return str(obj)
+
             with self.logpath.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(log_entry, ensure_ascii=False, default=str) + "\n")
+                f.write(json.dumps(log_entry, ensure_ascii=False, default=_custom_encoder) + "\n")
 
             print(
                 "👻 ShadowAgents: записан лог "

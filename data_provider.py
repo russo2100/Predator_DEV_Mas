@@ -31,19 +31,6 @@ class DataProvider:
                     break
 
             if not target_figi:
-                # Fallback: Если не нашли во фьючерсах, поищем в акциях (для тестов)
-                print(f"   ⚠️ Не найден во фьючерсах, ищу в акциях...")
-                shares = await client.instruments.shares(
-                    instrument_status=InstrumentStatus.INSTRUMENT_STATUS_BASE
-                )
-                for item in shares.instruments:
-                    if item.ticker == ticker:
-                        target_figi = item.figi
-                        print(
-                            f"   🎯 Нашел FIGI для {ticker} (Акция): {target_figi}")
-                        break
-
-            if not target_figi:
                 print(f"❌ Тикер {ticker} не найден!")
                 return DataFrame()
 
