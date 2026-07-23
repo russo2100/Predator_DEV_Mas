@@ -3,6 +3,13 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from datetime import datetime
 import httpx
+import sys
+
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
 
 # --- НАСТРОЙКИ ФИЛЬТРОВ ---
 # Газовые и инфраструктурные триггеры

@@ -44,7 +44,8 @@ import yaml
 from src.services.sleeping_market import SleepingMarketDetector, SleepingMarketInput
 from src.config.settings import settings
 from src.daily_limits import DailyLimitsManager, DailyLimitsConfig
-
+from hermes_upgrades.calendar_injector import CalendarInjector
+import datetime as dt_module
 
 load_dotenv()
 
@@ -126,11 +127,11 @@ def get_market_status():
         if not (start_trade <= current_time <= end_trade):
             return False, f"Суббота: торги 09:50 - 23:50 MSK"
     else:
-        # Пн-Пт: торги 08:50 - 23:50
-        start_trade = dt.time(8, 50)
+        # Пн-Пт: торги 10:00 - 23:50
+        start_trade = dt.time(10, 0)
         end_trade = dt.time(23, 50)
         if not (start_trade <= current_time <= end_trade):
-            return False, f"Вне времени торгов (08:50 - 23:50)"
+            return False, f"Вне времени торгов (10:00 - 23:50)"
 
     # 3. Клиринги (МСК)
     # Дневной: 14:00-14:05 | Вечерний: 18:50-19:05
@@ -1556,7 +1557,19 @@ def decide_action(
     trend_u = str(trend_5m).upper().strip()
     market_state_u = str(market_state).upper().strip()
     
+    # ---------- HERMES UPGRADES (EIA & Liquidity) ----------
+    current_time_msk = dt_module.datetime.now(ZoneInfo("Europe/Moscow"))
     
+    # 1. EIA Blackout (Thursdays 17:25 - 17:40 MSK)
+    if current_time_msk.weekday() == 3 and current_time_msk.hour == 17 and 25 <= current_time_msk.minute <= 40:
+        if lots == 0:
+            return "NOOP", "🚫 EIA BLACKOUT: Trading suspended during inventory report.", metadata
+            
+    # 2. Liquidity Window (Core Hours: 16:00 - 21:30 MSK)
+    if not (16 <= current_time_msk.hour <= 21):
+        if lots == 0 and market_state_u == "RANGE":
+            return "NOOP", "🚫 LIQUIDITY TRAP: Trading suspended outside core hours (16:00-21:30) in RANGE.", metadata
+            
             # ---------- RSI GATE (context-aware) ----------
     # Dynamic RSI thresholds based on trend context.
     trend_htf = str(rules.get("trend_htf", "NA")).upper() if rules else "NA"
@@ -2390,6 +2403,13 @@ async def main_loop():
     except Exception as e:
         print(f"⚠️ Ошибка init entry_time: {e}")
 
+
+    try:
+        from scripts.automation.ng_news_parser import main as update_news
+        print("📰 Выполняется сбор свежих новостей (при запуске)...")
+        await update_news()
+    except Exception as e:
+        print(f"⚠️ Ошибка сбора новостей при запуске: {e}")
 
     while True:
         try:
